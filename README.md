@@ -1,87 +1,99 @@
 # ralphi
 
-A fresh-context design loop for code-structuring and architecture problems.
+`arch_loop` — a fresh-context architecture/design search, installed as a DSH
+tool. One call creates the problem workspace, runs N design rounds with a new
+child agent each round, then one independent audit.
 
-One round = one fresh agent = one substantial investigation. No conversation
-carries over; the problem directory is the only memory. You set the round
-budget, the agent chooses each round whether to continue, simplify, experiment,
-or re-derive from first principles. Compute buys exploration, not longer
-documents.
+No manual setup: no template copying, no files to create, no workflow script to
+paste.
 
-## Layout
+## Use
 
 ```
-loop.workflow.js            the loop (pass its body to the workflow tool)
-problems/_template/         copy this per problem
-  CONTRACT.md               the only file a human must write; frozen
-  ARCHITECTURE.md           best-known design; changes need evidence
-  QUESTIONS.md              open questions, ranked by materiality
-  LOG.md                    append-only round record
-  experiments/              prototypes, benchmarks, re-derivations
+arch_loop({ goal: "Design a bounded LRU cache with O(1) get/put ...", rounds: 24 })
 ```
 
-One problem per directory. The loop is generic; only `CONTRACT.md` is specific.
+Optional arguments:
 
-## Start a problem
+| Argument | Meaning |
+|---|---|
+| `goal` | The problem. Requirements, constraints and non-goals when known. |
+| `constraints` | Hard constraints only: bounds, compatibility, runtime, invariants. |
+| `paths` | Existing files/directories a refactor target must account for. |
+| `rounds` | Design rounds. Default 24, ceiling 64 (`maxRounds` in config). |
+| `name` | Stable directory name. Reusing it resumes that problem. |
+
+The call is long-running and blocks the turn. Cancelling preserves every
+completed round; call again with the same `name` to continue.
+
+## What it creates
+
+```
+.ralphi/<slug>/
+  CONTRACT.md       goal + constraints + paths, written once; edit it to change the problem
+  ARCHITECTURE.md   best-known design; the worker replaces it only with evidence
+  QUESTIONS.md      material open questions
+  LOG.md            append-only per-round record
+  experiments/      prototypes, benchmarks, re-derivations
+  AUDIT.json        result of the independent audit
+  rounds.jsonl      structured per-round reports (controller-owned)
+  runs.jsonl        one record per arch_loop call (controller-owned)
+```
+
+Workers commit the problem directory each round when the workspace is a git repo,
+so `git log` is the design history.
+
+## What each round does
+
+1. Reads `CONTRACT.md`, `QUESTIONS.md`, `LOG.md`, `ARCHITECTURE.md`.
+2. Writes three candidate questions, ranks them by materiality, pursues the most
+   material one.
+3. Picks a mode: `continue`, `simplify`, `experiment`, or `rederive`.
+   `rederive` reads the contract only and writes an independent design before
+   looking at the incumbent.
+4. Updates the files, commits, and returns a small structured report.
+
+The final audit is a fresh agent that reads only the contract and the
+architecture, tries to implement it, and reports the first place it must invent
+unspecified semantics. `AUDIT.json` is the convergence check, not the worker's
+opinion.
+
+## Reviewing a run
 
 ```sh
-cp -r problems/_template problems/<slug>
-$EDITOR problems/<slug>/CONTRACT.md
-git add -A && git commit -m "start <slug>"
+git log --oneline -- .ralphi/<slug>
+git diff <start>.. -- .ralphi/<slug>/ARCHITECTURE.md
 ```
 
-Fill in the contract completely. Underdesign in the loop usually traces back to
-a contract that leaves behavior, constraints, or non-goals implicit.
+Then read `ARCHITECTURE.md`, `QUESTIONS.md`, and `AUDIT.json`. Useful signals:
 
-## Run
+- all rounds `continue`, no `simplify`/`rederive` → the loop is polishing
+- `AUDIT.json` material → reopen with a follow-up run
+- rounds stop adding material questions → kill the job (`job_kill`); state is
+  already committed
 
-Read `loop.workflow.js` and pass its **body** as `script`:
+## Install / update
 
-```js
-workflow({
-  meta: {
-    name: 'arch-ralph',
-    description: 'Fresh-context architecture design loop.',
-    phases: [{ title: 'Design rounds' }, { title: 'Independent audit' }],
-  },
-  script: '<contents of loop.workflow.js>',
-  args: { problem: 'problems/<slug>', rounds: 24 },
-  run_in_background: true,
-})
-```
+Installed in profile `web` as the bundle `@local/dsh-plugin-arch-loop`
+(`/home/cedric/dev/ralphi` is linked into the profile). After editing
+`plugin.js` or `cordis.patch.yml`, restart DSH: the live process imports the
+module once.
 
-Use 10 rounds to test whether the contract is clear, 24–40 for a real search.
-Collect with `job_output`; every round commits, so stopping early loses nothing.
-If the log stops producing material questions, `job_kill` the run — the loop
-always spends its full budget rather than trusting the worker's convergence
-claim.
+Config lives in `cordis.patch.yml`:
 
-## Review
+| Field | Default | Meaning |
+|---|---|---|
+| `provider` | `spawn` | Fresh subagent provider. Must support structured output and not inherit context. |
+| `maxRounds` | `64` | Per-call ceiling. |
+| `defaultRounds` | `24` | Used when `rounds` is omitted. |
 
-```sh
-git log --oneline -- problems/<slug>
-git diff <slug-start>.. -- problems/<slug>/ARCHITECTURE.md
-```
+## Deliberate limits
 
-Then read `ARCHITECTURE.md`, `QUESTIONS.md`, and the audit finding. Worth doing
-blind: look at the final design before looking at how many rounds produced it.
-A trajectory that is all `continue` with no `simplify` or `rederive` is a sign
-the loop is polishing instead of searching.
+- No resume checkpoint inside a call: state lives in files and git, not in a
+  controller process.
+- `rederive` blindness is procedural, not enforced.
+- Only the final audit is independent of the search; there is no per-round
+  auditor.
+- No token budget; round count is the only spend control.
 
-## What the loop enforces
-
-- fresh context every round; files are the handoff
-- three candidate questions and a materiality ranking before acting
-- one substantial investigation per round, with an explicit commit
-- a final independent audit that tries to implement the contract and reports the
-  first place it must invent unspecified semantics
-
-## What it does not do
-
-- no resume state beyond the files and git history
-- no per-round auditor, promotion gate, token budget, or candidate store
-- no true blindness for `rederive` (it is procedural; the worker could peek)
-- no enforcement that `ARCHITECTURE.md` changed only with evidence — review
-  `git log` for that
-
-Add machinery only when one of these actually breaks a run.
+Add machinery only when one of these breaks a run in practice.

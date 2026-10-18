@@ -1,0 +1,9 @@
+# arch_loop: one tool row in the host composition. It also appears inside agent
+# presets because the tool registry is global; workers are told not to call it.
+- insert:
+    - id: tool-arch-loop
+      name: '@local/dsh-plugin-arch-loop'
+      config:
+        provider: spawn
+        maxRounds: 64
+        defaultRounds: 24

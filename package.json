@@ -1,0 +1,20 @@
+{
+  "name": "@local/dsh-plugin-arch-loop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "arch_loop: fresh-context architecture-design search as a DSH tool",
+  "exports": {
+    ".": "./plugin.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "plugin.js",
+    "cordis.patch.yml"
+  ]
+}
