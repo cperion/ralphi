@@ -115,6 +115,13 @@ Each round spawns `pi --mode json -p --no-session --no-extensions --no-skills
 level. The worker writes `rounds/rNNN.json`; the tool validates that file, so no
 assistant prose is parsed. The audit writes `rounds/audit.json`.
 
+In the TUI the call renders as the goal plus round count, rounds stream as
+progress lines, the collapsed result shows status, mode mix and the audit
+verdict, and the expanded view (Ctrl+O) adds the audit consequence, the state
+path, and token/cost usage. The system prompt advertises the tool through its
+snippet and guidelines, and calls are serialised so two loops cannot fight over
+one problem directory.
+
 Pi loads extensions once at startup; after editing the extension, `/reload` in an
 interactive session (or restart) picks it up.
 

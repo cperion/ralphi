@@ -16,7 +16,8 @@ import { spawn } from "node:child_process"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
+import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent"
+import { Text } from "@earendil-works/pi-tui"
 import { Type } from "typebox"
 
 const MAX_ROUNDS = 64
@@ -49,6 +50,21 @@ interface Usage {
 	cacheWrite: number
 	cost: number
 	turns: number
+}
+
+/** Details shape carried to the TUI renderer. */
+interface ArchLoopDetails {
+	phase?: "round" | "audit"
+	round?: number
+	rounds?: number
+	mode?: string
+	status?: string
+	problemDir?: string
+	done?: number
+	modes?: Record<string, number>
+	audit?: AuditReport
+	failure?: string
+	usage?: Usage
 }
 
 const WORKER_PERSONA = `You are an architecture designer and adversarial simplifier. You search for the smallest set of concepts, states, invariants and representations that satisfies the contract. You do not write production code; a prototype, test or benchmark exists only to answer a question. You treat the current design, including your own previous rounds, as a hypothesis, not as a baseline to defend.`
@@ -177,6 +193,95 @@ function slugify(text: string): string {
 function clip(value: unknown, limit: number): string {
 	const text = String(value ?? "")
 	return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`
+}
+
+function formatTokens(count: number): string {
+	if (count < 1000) return String(count)
+	if (count < 10000) return `${(count / 1000).toFixed(1)}k`
+	if (count < 1000000) return `${Math.round(count / 1000)}k`
+	return `${(count / 1000000).toFixed(1)}M`
+}
+
+function textOf(content: Array<{ type: string; text?: string }>): string {
+	return content
+		.filter((part) => part.type === "text" && typeof part.text === "string")
+		.map((part) => part.text as string)
+		.join("\n")
+}
+
+function renderCall(args: Record<string, unknown>, theme: Theme) {
+	const goal = clip(args?.goal, 72)
+	const rounds = typeof args?.rounds === "number" ? args.rounds : DEFAULT_ROUNDS
+	return new Text(
+		`${theme.fg("toolTitle", theme.bold("arch_loop"))} ${theme.fg("accent", goal)} ${theme.fg("muted", `· ${rounds} rounds`)}`,
+		0,
+		0,
+	)
+}
+
+function renderResult(
+	result: { content: Array<{ type: string; text?: string }>; details?: ArchLoopDetails },
+	options: { expanded: boolean; isPartial: boolean },
+	theme: Theme,
+) {
+	const details = result.details
+	if (options.isPartial || details?.status === undefined) {
+		const progress = textOf(result.content)
+		return new Text(theme.fg("muted", progress.length > 0 ? progress : "running…"), 0, 0)
+	}
+
+	const ok = details.status === "complete"
+	const icon = ok ? theme.fg("success", "✓") : theme.fg("error", "✗")
+	const lines: string[] = [
+		`${icon} ${theme.fg("toolTitle", theme.bold("arch_loop"))} ${theme.fg("muted", details.status)} ${theme.fg("accent", `${details.done ?? 0}/${details.rounds ?? 0}`)} ${theme.fg("muted", "rounds")}`,
+	]
+
+	if (details.modes) {
+		const modes = details.modes
+		lines.push(
+			theme.fg(
+				"muted",
+				`modes  ${modes.continue ?? 0} continue · ${modes.simplify ?? 0} simplify · ${modes.experiment ?? 0} experiment · ${modes.rederive ?? 0} rederive`,
+			),
+		)
+	}
+
+	if (details.audit) {
+		if (details.audit.material) {
+			lines.push(
+				theme.fg("warning", "audit  MATERIAL GAP — ") +
+					theme.fg("text", clip(details.audit.finding, options.expanded ? 4000 : 110)),
+			)
+			if (options.expanded) lines.push(theme.fg("muted", `consequence  ${details.audit.consequence}`))
+		} else {
+			lines.push(theme.fg("success", "audit  no material gap"))
+		}
+	}
+
+	if (details.failure) {
+		lines.push(theme.fg("error", `failure  ${clip(details.failure, options.expanded ? 4000 : 140)}`))
+	}
+
+	if (options.expanded) {
+		lines.push("")
+		if (details.problemDir) {
+			lines.push(
+				theme.fg("muted", "state      ") +
+					theme.fg("accent", `${details.problemDir}/{ARCHITECTURE.md,QUESTIONS.md,LOG.md}`),
+			)
+		}
+		if (details.usage) {
+			const usage = details.usage
+			lines.push(
+				theme.fg(
+					"muted",
+					`usage      ${usage.turns ?? 0} turns · ↑${formatTokens(usage.input)} ↓${formatTokens(usage.output)} · $${(usage.cost ?? 0).toFixed(4)}`,
+				),
+			)
+		}
+	}
+
+	return new Text(lines.join("\n"), 0, 0)
 }
 
 function readArgs(raw: Record<string, unknown>, maxRounds: number, defaultRounds: number): ArchLoopArgs {
@@ -427,6 +532,14 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "arch_loop",
 		label: "Architecture Loop",
+		promptSnippet:
+			"Run a fresh-context architecture design search: repeated design/experiment rounds, then an independent audit of the result",
+		promptGuidelines: [
+			"Use arch_loop for architecture, code-structuring, refactor-target and design questions where exploring alternatives and verifying the target matters more than writing production code.",
+			"arch_loop is long-running and blocks the turn. Prefer it when the user wants a considered design target rather than an immediate answer.",
+			"Do not use arch_loop for small edits, bug fixes, or questions answerable by reading the code once.",
+		],
+		executionMode: "sequential",
 		description:
 			"Run a fresh-context architecture-design search on a problem. Creates or resumes .ralphi/<name>/ in the workspace, runs one substantial design iteration per round in a fresh pi child process, then one independent audit. Use for architecture, code-structuring, refactor-target and design questions. Long-running: it blocks the turn until all rounds and the audit finish; cancellation preserves every completed round.",
 		parameters: Type.Object({
@@ -443,6 +556,9 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 				Type.String({ description: "Problem directory name. Defaults to a slug of the goal. Reusing a name resumes that problem." }),
 			),
 		}),
+
+		renderCall,
+		renderResult,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const args = readArgs(params as Record<string, unknown>, maxRounds, defaultRounds)
