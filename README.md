@@ -1,11 +1,16 @@
 # ralphi
 
-`arch_loop` — a fresh-context architecture/design search, installed as a DSH
-tool. One call creates the problem workspace, runs N design rounds with a new
-child agent each round, then one independent audit.
+`arch_loop` — a fresh-context architecture/design search, installed as a tool in
+both harnesses. One call creates the problem workspace, runs N design rounds
+with a new child agent each round, then one independent audit.
 
 No manual setup: no template copying, no files to create, no workflow script to
 paste.
+
+| Harness | Integration | Child per round |
+|---|---|---|
+| DSH | Host plugin + `Coder & Organizer` preset row | in-process fresh subagent |
+| pi | extension package (`pi/extensions/arch-loop.ts`) | fresh `pi` child process |
 
 ## Use
 
@@ -36,6 +41,7 @@ completed round; call again with the same `name` to continue.
   LOG.md            append-only per-round record
   experiments/      prototypes, benchmarks, re-derivations
   AUDIT.json        result of the independent audit
+  rounds/           per-round report files (pi port; `rNNN.json` + `audit.json`)
   rounds.jsonl      structured per-round reports (controller-owned)
   runs.jsonl        one record per arch_loop call (controller-owned)
 ```
@@ -93,6 +99,28 @@ Config lives in `cordis.patch.yml`:
 | `provider` | `spawn` | Fresh subagent provider. Must support structured output and not inherit context. |
 | `maxRounds` | `64` | Per-call ceiling. |
 | `defaultRounds` | `24` | Used when `rounds` is omitted. |
+
+### pi
+
+The extension lives in [`pi/`](pi/): `pi/package.json` declares the package, and
+`pi/extensions/arch-loop.ts` registers the same tool.
+
+```sh
+pi install /home/cedric/dev/ralphi/pi
+```
+
+Each round spawns `pi --mode json -p --no-session --no-extensions --no-skills
+--no-prompt-templates --tools read,write,edit,bash,grep,find,ls
+--append-system-prompt <worker.md>`, inheriting the parent model and thinking
+level. The worker writes `rounds/rNNN.json`; the tool validates that file, so no
+assistant prose is parsed. The audit writes `rounds/audit.json`.
+
+Pi loads extensions once at startup; after editing the extension, `/reload` in an
+interactive session (or restart) picks it up.
+
+`arch_loop` is installed globally in `~/.pi/agent/settings.json`. To scope it to
+one project instead, `pi install -l /home/cedric/dev/ralphi/pi` from that
+project.
 
 ## Deliberate limits
 

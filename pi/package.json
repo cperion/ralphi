@@ -1,0 +1,19 @@
+{
+  "name": "@local/pi-arch-loop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "arch_loop for pi: fresh-context architecture design search",
+  "keywords": [
+    "pi-package"
+  ],
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
