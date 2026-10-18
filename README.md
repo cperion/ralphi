@@ -52,6 +52,9 @@ workflow({
 
 Use 10 rounds to test whether the contract is clear, 24–40 for a real search.
 Collect with `job_output`; every round commits, so stopping early loses nothing.
+If the log stops producing material questions, `job_kill` the run — the loop
+always spends its full budget rather than trusting the worker's convergence
+claim.
 
 ## Review
 
