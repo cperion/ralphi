@@ -75,9 +75,16 @@ Then read `ARCHITECTURE.md`, `QUESTIONS.md`, and `AUDIT.json`. Useful signals:
 ## Install / update
 
 Installed in profile `web` as the bundle `@local/dsh-plugin-arch-loop`
-(`/home/cedric/dev/ralphi` is linked into the profile). After editing
-`plugin.js` or `cordis.patch.yml`, restart DSH: the live process imports the
-module once.
+(`/home/cedric/dev/ralphi` is linked into the profile). It is registered twice,
+deliberately:
+
+- host scope, from this bundle's `cordis.patch.yml` — available to every agent;
+- `Coder & Organizer` preset (`preset-coder`), inside the user's
+  `dsh-presets/coder-preset` package — the tool belongs to that agent's
+  composition. Scoped registration shadows the global one for that agent.
+
+After editing `plugin.js` or either patch, restart DSH: the live process imports
+each module generation once, and an entry that failed to import cannot recover.
 
 Config lives in `cordis.patch.yml`:
 
