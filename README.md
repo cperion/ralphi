@@ -25,16 +25,20 @@ Optional arguments:
 | `goal` | The problem. Requirements, constraints and non-goals when known. |
 | `constraints` | Hard constraints only: bounds, compatibility, runtime, invariants. |
 | `paths` | Existing files/directories a refactor target must account for. |
-| `rounds` | Design rounds. Default 24, ceiling 64 (`maxRounds` in config). |
+| `rounds` | Design rounds to run in this call. Default 24, ceiling 64 (`maxRounds` in config); later calls add more. |
 | `name` | Stable directory name. Reusing it resumes that problem. |
+| `project` | Repository root that owns `docs/arch-loop/`. Defaults to the git root containing the workspace, else the workspace. |
 
 The call is long-running and blocks the turn. Cancelling preserves every
 completed round; call again with the same `name` to continue.
 
 ## What it creates
 
+Inside the project repository, so the design record is versioned with the code
+and committed by the workers:
+
 ```
-.ralphi/<slug>/
+docs/arch-loop/<slug>/
   CONTRACT.md       goal + constraints + paths, written once; edit it to change the problem
   ARCHITECTURE.md   best-known design; the worker replaces it only with evidence
   QUESTIONS.md      material open questions
@@ -44,6 +48,7 @@ completed round; call again with the same `name` to continue.
   rounds/           per-round report files (pi port; `rNNN.json` + `audit.json`)
   rounds.jsonl      structured per-round reports (controller-owned)
   runs.jsonl        one record per arch_loop call (controller-owned)
+  STATE.json        controller-owned resume marker (next round, in-progress round)
 ```
 
 Workers commit the problem directory each round when the workspace is a git repo,
@@ -64,11 +69,26 @@ architecture, tries to implement it, and reports the first place it must invent
 unspecified semantics. `AUDIT.json` is the convergence check, not the worker's
 opinion.
 
+## Resume
+
+`STATE.json` is rewritten atomically after every round, before and after each
+child runs. If DSH or the machine stops mid-call, call `arch_loop` again with the
+same `name` and `goal`:
+
+- completed rounds are never repeated;
+- a round whose report was already written is ingested instead of re-run (pi);
+- a round that was interrupted mid-flight is retried from `STATE.inProgress`;
+- rounds continue numbering upward, and `rounds` is the budget for this call.
+
+A later call with the same `name` but a different `goal` is rejected, so a
+resumed run cannot silently drift. Use a new name, or delete
+`docs/arch-loop/<slug>/`, to start over.
+
 ## Reviewing a run
 
 ```sh
-git log --oneline -- .ralphi/<slug>
-git diff <start>.. -- .ralphi/<slug>/ARCHITECTURE.md
+git log --oneline -- docs/arch-loop/<slug>
+git diff <start>.. -- docs/arch-loop/<slug>/ARCHITECTURE.md
 ```
 
 Then read `ARCHITECTURE.md`, `QUESTIONS.md`, and `AUDIT.json`. Useful signals:
@@ -111,9 +131,10 @@ pi install /home/cedric/dev/ralphi/pi
 
 Each round spawns `pi --mode json -p --no-session --no-extensions --no-skills
 --no-prompt-templates --tools read,write,edit,bash,grep,find,ls
---append-system-prompt <worker.md>`, inheriting the parent model and thinking
-level. The worker writes `rounds/rNNN.json`; the tool validates that file, so no
-assistant prose is parsed. The audit writes `rounds/audit.json`.
+--append-system-prompt <worker.md>`, in the project root and inheriting the
+parent model and thinking level. The worker writes `rounds/rNNN.json`; the tool
+validates that file, so no assistant prose is parsed. The audit writes
+`rounds/audit.json`.
 
 In the TUI the call renders as the goal plus round count, rounds stream as
 progress lines, the collapsed result shows status, mode mix and the audit
@@ -131,8 +152,8 @@ project.
 
 ## Deliberate limits
 
-- No resume checkpoint inside a call: state lives in files and git, not in a
-  controller process.
+- A round is the resume granularity: work done by a child that dies mid-round is
+  lost and that round is retried, not resumed mid-conversation.
 - `rederive` blindness is procedural, not enforced.
 - Only the final audit is independent of the search; there is no per-round
   auditor.

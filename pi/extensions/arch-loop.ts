@@ -1,7 +1,8 @@
 /**
  * arch_loop for pi — fresh-context architecture design search as one tool.
  *
- * One call scaffolds `.ralphi/<slug>/`, runs N design rounds each in a fresh
+ * One call scaffolds `docs/arch-loop/<slug>/` inside the project repository,
+ * runs N design rounds each in a fresh
  * `pi` child process, then one independent audit. The problem directory is the
  * only memory between rounds: no conversation is carried over.
  *
@@ -61,6 +62,9 @@ interface ArchLoopDetails {
 	status?: string
 	problemDir?: string
 	done?: number
+	completedRounds?: number
+	nextRound?: number
+	resumedFrom?: number
 	modes?: Record<string, number>
 	audit?: AuditReport
 	failure?: string
@@ -101,7 +105,7 @@ const AUDIT_PROTOCOL = `Independent audit. You have not seen this search. Read o
 
 Attempt to implement the essential required behavior from those documents alone. Every time you must invent a semantic decision the design did not specify, note it. Then judge whether one material gap remains: an omission that changes correctness, a representation that forces accidental complexity, or a simpler formulation the design missed.
 
-material=false only if you could implement the contract without inventing anything material and found no simpler representation. finding: the single most consequential gap, or "none". consequence: what breaks, or what an implementer must guess, if it is not fixed.
+material=false only if you could implement the contract without inventing anything material and found no simpler representation. finding: the single most consequential gap, or "none". consequence: what breaks, or what an implementer must guess, if it is not fixed; use "" when material is false.
 
 Your final action must be writing the audit JSON file named in the user message, with exactly these fields and nothing else:
 {"material": true|false, "finding": "string", "consequence": "string"}`
@@ -164,7 +168,20 @@ interface ArchLoopArgs {
 	constraints?: string
 	paths: string[]
 	rounds: number
+	project?: string
 	slug: string
+}
+
+/** Controller-owned resume marker, rewritten atomically after every round. */
+interface RunState {
+	version: number
+	slug: string
+	goal: string
+	nextRound: number
+	completedRounds: number
+	status: string
+	inProgress: number | null
+	updatedAt?: string
 }
 
 interface ChildResult {
@@ -187,6 +204,7 @@ function slugify(text: string): string {
 		.replace(/[^a-z0-9]+/g, "-")
 		.replace(/^-+|-+$/g, "")
 		.slice(0, 48)
+		.replace(/-+$/, "")
 	return slug.length > 0 ? slug : "problem"
 }
 
@@ -232,8 +250,11 @@ function renderResult(
 
 	const ok = details.status === "complete"
 	const icon = ok ? theme.fg("success", "✓") : theme.fg("error", "✗")
+	const progress = details.completedRounds === undefined
+		? `${details.done ?? 0}/${details.rounds ?? 0}`
+		: `${details.done ?? 0}/${details.rounds ?? 0} this call · ${details.completedRounds} total`
 	const lines: string[] = [
-		`${icon} ${theme.fg("toolTitle", theme.bold("arch_loop"))} ${theme.fg("muted", details.status)} ${theme.fg("accent", `${details.done ?? 0}/${details.rounds ?? 0}`)} ${theme.fg("muted", "rounds")}`,
+		`${icon} ${theme.fg("toolTitle", theme.bold("arch_loop"))} ${theme.fg("muted", details.status)} ${theme.fg("accent", progress)} ${theme.fg("muted", "rounds")}`,
 	]
 
 	if (details.modes) {
@@ -264,12 +285,14 @@ function renderResult(
 
 	if (options.expanded) {
 		lines.push("")
+		if (details.resumedFrom !== undefined) lines.push(theme.fg("muted", `resumed    from round ${details.resumedFrom}`))
 		if (details.problemDir) {
 			lines.push(
 				theme.fg("muted", "state      ") +
-					theme.fg("accent", `${details.problemDir}/{ARCHITECTURE.md,QUESTIONS.md,LOG.md}`),
+					theme.fg("accent", `${details.problemDir}/{ARCHITECTURE.md,QUESTIONS.md,LOG.md,STATE.json}`),
 			)
 		}
+		if (details.nextRound !== undefined) lines.push(theme.fg("muted", `next       continues at round ${details.nextRound}`))
 		if (details.usage) {
 			const usage = details.usage
 			lines.push(
@@ -294,8 +317,9 @@ function readArgs(raw: Record<string, unknown>, maxRounds: number, defaultRounds
 	if (typeof rounds !== "number" || !Number.isSafeInteger(rounds) || rounds < 1 || rounds > maxRounds) {
 		throw new Error(`arch_loop: rounds must be an integer between 1 and ${maxRounds}`)
 	}
+	const project = typeof raw.project === "string" && raw.project.trim().length > 0 ? raw.project.trim() : undefined
 	const name = typeof raw.name === "string" && raw.name.trim().length > 0 ? raw.name.trim() : goal
-	return { goal, constraints, paths, rounds, slug: slugify(name) }
+	return { goal, constraints, paths, rounds, project, slug: slugify(name) }
 }
 
 function contractText(args: ArchLoopArgs): string {
@@ -329,6 +353,94 @@ function ensureState(dir: string, args: ArchLoopArgs): void {
 	ensureFile(path.join(dir, "ARCHITECTURE.md"), ARCHITECTURE_TEMPLATE)
 	ensureFile(path.join(dir, "QUESTIONS.md"), QUESTIONS_TEMPLATE)
 	ensureFile(path.join(dir, "LOG.md"), LOG_HEADER)
+}
+
+const STATE_FILE = "STATE.json"
+
+function atomicWrite(filePath: string, text: string): void {
+	const tmp = `${filePath}.${process.pid}.tmp`
+	fs.writeFileSync(tmp, text, "utf8")
+	fs.renameSync(tmp, filePath)
+}
+
+function findProjectRoot(start: string): string | undefined {
+	let current = path.resolve(start)
+	for (;;) {
+		if (fs.existsSync(path.join(current, ".git"))) return current
+		const parent = path.dirname(current)
+		if (parent === current) return undefined
+		current = parent
+	}
+}
+
+function resolveProjectRoot(rawProject: string | undefined, workspace: string): string {
+	if (rawProject !== undefined) {
+		const candidate = path.resolve(workspace, rawProject)
+		if (!fs.existsSync(candidate) || !fs.statSync(candidate).isDirectory()) {
+			throw new Error(`arch_loop: project path is not a directory: ${candidate}`)
+		}
+		return candidate
+	}
+	return findProjectRoot(workspace) ?? workspace
+}
+
+function readState(dir: string): RunState | undefined {
+	const file = path.join(dir, STATE_FILE)
+	if (!fs.existsSync(file)) return undefined
+	try {
+		const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as RunState
+		if (typeof parsed !== "object" || parsed === null) return undefined
+		if (!Number.isSafeInteger(parsed.nextRound) || !Number.isSafeInteger(parsed.completedRounds)) return undefined
+		return parsed
+	} catch {
+		return undefined
+	}
+}
+
+function writeState(dir: string, state: RunState): void {
+	atomicWrite(path.join(dir, STATE_FILE), `${JSON.stringify({ ...state, updatedAt: new Date().toISOString() }, null, 2)}\n`)
+}
+
+function readLastReport(dir: string): RoundReport | undefined {
+	const file = path.join(dir, "rounds.jsonl")
+	if (!fs.existsSync(file)) return undefined
+	const lines = fs.readFileSync(file, "utf8").trim().split("\n")
+	for (let index = lines.length - 1; index >= 0; index -= 1) {
+		try {
+			const entry = JSON.parse(lines[index]) as RoundReport & { round?: number }
+			if (entry !== null && typeof entry === "object" && typeof entry.mode === "string") {
+				return {
+					mode: entry.mode,
+					question: entry.question,
+					evidence: entry.evidence,
+					decision: entry.decision,
+					next: entry.next,
+				}
+			}
+		} catch {
+			/* skip malformed line */
+		}
+	}
+	return undefined
+}
+
+function isRoundIngested(dir: string, round: number): boolean {
+	const file = path.join(dir, "rounds.jsonl")
+	if (!fs.existsSync(file)) return false
+	for (const line of fs.readFileSync(file, "utf8").trim().split("\n")) {
+		try {
+			const entry = JSON.parse(line) as { round?: number }
+			if (entry.round === round) return true
+		} catch {
+			/* skip malformed line */
+		}
+	}
+	return false
+}
+
+function ingestRound(dir: string, round: number, report: RoundReport): void {
+	if (isRoundIngested(dir, round)) return
+	fs.appendFileSync(path.join(dir, "rounds.jsonl"), `${JSON.stringify({ at: new Date().toISOString(), round, ...report })}\n`, "utf8")
 }
 
 function padRound(round: number): string {
@@ -470,31 +582,40 @@ function readAuditReport(filePath: string): { value?: AuditReport; error?: strin
 	const record = parsed as Record<string, unknown>
 	if (typeof record.material !== "boolean") return { error: "audit.material must be a boolean" }
 	if (typeof record.finding !== "string") return { error: "audit.finding must be a string" }
-	if (typeof record.consequence !== "string") return { error: "audit.consequence must be a string" }
-	return { value: record as unknown as AuditReport }
+	let consequence = ""
+	if (typeof record.consequence === "string") consequence = record.consequence
+	else if (record.material) return { error: "audit.consequence must be a string when material is true" }
+	return { value: { material: record.material, finding: record.finding, consequence } }
 }
 
-function roundPrompt(problemDir: string, round: number, total: number, previous: RoundReport | undefined, reportPath: string): string {
+function roundPrompt(
+	problemAbs: string,
+	projectRoot: string,
+	problemRel: string,
+	round: number,
+	previous: RoundReport | undefined,
+	reportAbs: string,
+): string {
 	const prior = previous === undefined
-		? "This is the first round: ARCHITECTURE.md has no candidate yet."
+		? "No previous round report exists: ARCHITECTURE.md may still have no candidate."
 		: `Previous round report: ${JSON.stringify(previous)}`
-	return `Problem directory (relative to the workspace root): ${problemDir}/
-Files: ${problemDir}/CONTRACT.md, ${problemDir}/QUESTIONS.md, ${problemDir}/LOG.md, ${problemDir}/ARCHITECTURE.md
+	return `Problem directory: ${problemAbs}
+Files: ${problemAbs}/CONTRACT.md, ${problemAbs}/QUESTIONS.md, ${problemAbs}/LOG.md, ${problemAbs}/ARCHITECTURE.md
 
-Round ${round} of ${total}. ${prior}
+Round ${round}. ${prior}
 
-Prefix experiment files with the round number.
+Prefix experiment files with the round number. Keep everything inside the problem directory.
 
-Write your round report to: ${reportPath}
-Overwrite that file if it exists. Then, if the workspace is a git repository, commit exactly your problem directory:
-git add ${problemDir} && git commit -m "arch_loop round ${round}"`
+Write your round report to: ${reportAbs}
+Overwrite that file if it exists. Then, if the project is a git repository, commit only this directory:
+git -C "${projectRoot}" add "${problemRel}" && git -C "${projectRoot}" commit -m "arch_loop round ${round}"`
 }
 
-function auditPrompt(problemDir: string, reportPath: string): string {
-	return `Problem directory (relative to the workspace root): ${problemDir}/
-Read only: ${problemDir}/CONTRACT.md and ${problemDir}/ARCHITECTURE.md
+function auditPrompt(problemAbs: string, reportAbs: string): string {
+	return `Problem directory: ${problemAbs}
+Read only: ${problemAbs}/CONTRACT.md and ${problemAbs}/ARCHITECTURE.md
 
-Write your audit report to: ${reportPath}
+Write your audit report to: ${reportAbs}
 Overwrite that file if it exists.`
 }
 
@@ -503,6 +624,9 @@ function renderSummary(value: {
 	problemDir: string
 	rounds: number
 	done: number
+	completedRounds?: number
+	nextRound?: number
+	resumedFrom?: number
 	modes: string
 	lastQuestion?: string
 	lastDecision?: string
@@ -510,7 +634,11 @@ function renderSummary(value: {
 	failure?: string
 }): string {
 	const lines: string[] = []
-	lines.push(`arch_loop ${value.status} — ${value.problemDir} — ${value.done}/${value.rounds} rounds`)
+	const progress = value.completedRounds === undefined
+		? `${value.done}/${value.rounds} rounds`
+		: `${value.done}/${value.rounds} rounds this call · ${value.completedRounds} total`
+	lines.push(`arch_loop ${value.status} — ${value.problemDir} — ${progress}`)
+	if (value.resumedFrom !== undefined) lines.push(`resumed from round ${value.resumedFrom}`)
 	lines.push(`modes: ${value.modes}`)
 	if (value.lastQuestion !== undefined) lines.push(`last question: ${value.lastQuestion}`)
 	if (value.lastDecision !== undefined) lines.push(`last decision: ${value.lastDecision}`)
@@ -521,7 +649,14 @@ function renderSummary(value: {
 		if (value.audit.material) lines.push(`consequence: ${value.audit.consequence}`)
 	}
 	if (value.failure !== undefined) lines.push(`failure: ${value.failure}`)
-	lines.push(`state: ${value.problemDir}/{ARCHITECTURE.md,QUESTIONS.md,LOG.md}`)
+	if (value.nextRound !== undefined) {
+		lines.push(
+			value.status === "complete"
+				? `next call starts at round ${value.nextRound}`
+				: `next call continues at round ${value.nextRound}`,
+		)
+	}
+	lines.push(`state: ${value.problemDir}/{ARCHITECTURE.md,QUESTIONS.md,LOG.md,STATE.json}`)
 	return lines.join("\n")
 }
 
@@ -541,7 +676,7 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 		],
 		executionMode: "sequential",
 		description:
-			"Run a fresh-context architecture-design search on a problem. Creates or resumes .ralphi/<name>/ in the workspace, runs one substantial design iteration per round in a fresh pi child process, then one independent audit. Use for architecture, code-structuring, refactor-target and design questions. Long-running: it blocks the turn until all rounds and the audit finish; cancellation preserves every completed round.",
+			"Run a resumable fresh-context architecture-design search on a problem. Creates or resumes docs/arch-loop/<name>/ inside the project repository (git root of the workspace by default), runs one substantial design iteration per round in a fresh pi child process, then one independent audit. STATE.json is updated after every round, so an interrupted call continues from the next round when called again with the same name. Use for architecture, code-structuring, refactor-target and design questions. Long-running: it blocks the turn until the call budget and audit finish.",
 		parameters: Type.Object({
 			goal: Type.String({
 				description:
@@ -551,9 +686,17 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 				Type.String({ description: "Hard constraints only: performance bounds, compatibility, language/runtime, invariants." }),
 			),
 			paths: Type.Optional(Type.Array(Type.String(), { description: "Existing files or directories the design must account for (refactors)." })),
-			rounds: Type.Optional(Type.Number({ description: `Number of design rounds. Default ${DEFAULT_ROUNDS}, maximum ${MAX_ROUNDS}.` })),
+			rounds: Type.Optional(
+				Type.Number({ description: `Design rounds to run in this call. Default ${DEFAULT_ROUNDS}, maximum ${MAX_ROUNDS}; later calls add more.` }),
+			),
 			name: Type.Optional(
 				Type.String({ description: "Problem directory name. Defaults to a slug of the goal. Reusing a name resumes that problem." }),
+			),
+			project: Type.Optional(
+				Type.String({
+					description:
+						"Project repository root that owns docs/arch-loop/. Relative paths resolve against the workspace. Defaults to the git root containing the workspace, or the workspace itself.",
+				}),
 			),
 		}),
 
@@ -563,9 +706,55 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const args = readArgs(params as Record<string, unknown>, maxRounds, defaultRounds)
 			const workspace = ctx.cwd
-			const dir = path.join(workspace, ".ralphi", args.slug)
-			const problemDir = `.ralphi/${args.slug}`
-			ensureState(dir, args)
+			const projectRoot = resolveProjectRoot(args.project, workspace)
+			const problemRel = `docs/arch-loop/${args.slug}`
+			const problemAbs = path.join(projectRoot, "docs", "arch-loop", args.slug)
+
+			const existing = readState(problemAbs)
+			if (existing !== undefined && typeof existing.goal === "string" && existing.goal.trim() !== args.goal) {
+				throw new Error(`arch_loop: "${args.slug}" already exists in ${problemRel} with a different goal. Use a different name, or delete that directory to start over.`)
+			}
+			ensureState(problemAbs, args)
+
+			const resumed = existing !== undefined
+			let state: RunState = existing ?? {
+				version: 1,
+				slug: args.slug,
+				goal: args.goal,
+				nextRound: 1,
+				completedRounds: 0,
+				status: "running",
+				inProgress: null,
+			}
+			if (!Number.isSafeInteger(state.inProgress)) state.inProgress = null
+
+			// Crash after the child wrote its report but before the state advanced:
+			// ingest that report instead of paying for the round again.
+			if (state.inProgress !== null) {
+				const pending = readRoundReport(path.join(problemAbs, "rounds", `r${padRound(state.inProgress)}.json`))
+				if (pending.value !== undefined) {
+					ingestRound(problemAbs, state.inProgress, pending.value)
+					state = {
+						...state,
+						completedRounds: Math.max(state.completedRounds, state.inProgress),
+						inProgress: null,
+						nextRound: state.inProgress + 1,
+					}
+					writeState(problemAbs, state)
+				}
+			}
+
+			let round = state.inProgress ?? state.nextRound
+			const resumedFrom = resumed ? round : undefined
+			const startedAt = new Date().toISOString()
+			const trajectory: RoundReport[] = []
+			let status = "complete"
+			let failure: string | undefined
+			let audit: AuditReport | undefined
+			const totalUsage = emptyUsage()
+
+			state = { ...state, status: "running" }
+			writeState(problemAbs, state)
 
 			const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "pi-arch-loop-"))
 			const workerPromptPath = path.join(scratch, "worker.md")
@@ -589,23 +778,29 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 				return result
 			}
 
-			const startedAt = new Date().toISOString()
-			const trajectory: RoundReport[] = []
-			let status = "complete"
-			let failure: string | undefined
-			let audit: AuditReport | undefined
-			const totalUsage = emptyUsage()
+			const addUsage = (child: ChildResult) => {
+				totalUsage.input += child.usage.input
+				totalUsage.output += child.usage.output
+				totalUsage.cacheRead += child.usage.cacheRead
+				totalUsage.cacheWrite += child.usage.cacheWrite
+				totalUsage.cost += child.usage.cost
+				totalUsage.turns += child.usage.turns
+			}
 
 			const recordRun = () => {
 				try {
 					fs.appendFileSync(
-						path.join(dir, "runs.jsonl"),
+						path.join(problemAbs, "runs.jsonl"),
 						`${JSON.stringify({
 							at: startedAt,
 							finishedAt: new Date().toISOString(),
 							goal: args.goal,
+							projectRoot,
 							rounds: args.rounds,
 							done: trajectory.length,
+							firstRound: resumedFrom ?? 1,
+							completedRounds: state.completedRounds,
+							nextRound: state.nextRound,
 							status,
 							failure,
 						})}\n`,
@@ -617,39 +812,35 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 			}
 
 			try {
-				let previous: RoundReport | undefined
-				for (let round = 1; round <= args.rounds; round += 1) {
+				while (trajectory.length < args.rounds) {
 					if (signal?.aborted) {
 						status = "cancelled"
 						failure = "cancelled by the caller"
 						break
 					}
-					const reportRel = `${problemDir}/rounds/r${padRound(round)}.json`
-					const reportAbs = path.join(dir, "rounds", `r${padRound(round)}.json`)
+					const reportAbs = path.join(problemAbs, "rounds", `r${padRound(round)}.json`)
 					fs.rmSync(reportAbs, { force: true })
+					state = { ...state, status: "running", inProgress: round, nextRound: round }
+					writeState(problemAbs, state)
 
 					onUpdate?.({
-						content: [{ type: "text", text: `arch_loop ${args.slug}: round ${round}/${args.rounds} running…` }],
+						content: [{ type: "text", text: `arch_loop ${args.slug}: round ${round} running…` }],
 						details: { phase: "round", round, rounds: args.rounds },
 					})
 
 					const child = await runChild({
 						args: childArgs(workerPromptPath),
-						prompt: roundPrompt(problemDir, round, args.rounds, previous, reportRel),
-						cwd: workspace,
+						prompt: roundPrompt(problemAbs, projectRoot, problemRel, round, readLastReport(problemAbs), reportAbs),
+						cwd: projectRoot,
 						signal,
 					})
-					totalUsage.input += child.usage.input
-					totalUsage.output += child.usage.output
-					totalUsage.cacheRead += child.usage.cacheRead
-					totalUsage.cacheWrite += child.usage.cacheWrite
-					totalUsage.cost += child.usage.cost
-					totalUsage.turns += child.usage.turns
+					addUsage(child)
 
 					if (!child.ok) {
 						status = "round-failed"
 						const detail = child.errorMessage ?? child.stderr.trim().split("\n").slice(-3).join(" | ")
 						failure = `round ${round}: child exited ${child.code}${detail ? ` — ${clip(detail, 400)}` : ""}`
+						writeState(problemAbs, { ...state, status })
 						break
 					}
 
@@ -657,37 +848,29 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 					if (report.error !== undefined) {
 						status = "round-failed"
 						failure = `round ${round}: ${report.error}`
+						writeState(problemAbs, { ...state, status })
 						break
 					}
-					previous = report.value
+
+					ingestRound(problemAbs, round, report.value as RoundReport)
+					state = { ...state, completedRounds: round, inProgress: null, nextRound: round + 1 }
+					writeState(problemAbs, state)
 					trajectory.push(report.value as RoundReport)
-					try {
-						fs.appendFileSync(
-							path.join(dir, "rounds.jsonl"),
-							`${JSON.stringify({
-								at: new Date().toISOString(),
-								round,
-								...report.value,
-							})}\n`,
-							"utf8",
-						)
-					} catch {
-						/* state reporting is best-effort */
-					}
+
 					onUpdate?.({
 						content: [
 							{
 								type: "text",
-								text: `arch_loop ${args.slug}: ${round}/${args.rounds} done — ${report.value?.mode}: ${clip(report.value?.question, 120)}`,
+								text: `arch_loop ${args.slug}: ${round} done — ${report.value?.mode}: ${clip(report.value?.question, 120)}`,
 							},
 						],
 						details: { phase: "round", round, rounds: args.rounds, mode: report.value?.mode },
 					})
+					round += 1
 				}
 
 				if (status === "complete" && !signal?.aborted) {
-					const auditRel = `${problemDir}/rounds/audit.json`
-					const auditAbs = path.join(dir, "rounds", "audit.json")
+					const auditAbs = path.join(problemAbs, "rounds", "audit.json")
 					fs.rmSync(auditAbs, { force: true })
 					onUpdate?.({
 						content: [{ type: "text", text: `arch_loop ${args.slug}: independent audit…` }],
@@ -695,16 +878,11 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 					})
 					const child = await runChild({
 						args: childArgs(auditPromptPath),
-						prompt: auditPrompt(problemDir, auditRel),
-						cwd: workspace,
+						prompt: auditPrompt(problemAbs, auditAbs),
+						cwd: projectRoot,
 						signal,
 					})
-					totalUsage.input += child.usage.input
-					totalUsage.output += child.usage.output
-					totalUsage.cacheRead += child.usage.cacheRead
-					totalUsage.cacheWrite += child.usage.cacheWrite
-					totalUsage.cost += child.usage.cost
-					totalUsage.turns += child.usage.turns
+					addUsage(child)
 
 					if (!child.ok) {
 						status = "audit-failed"
@@ -718,7 +896,7 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 						} else {
 							audit = parsed.value
 							try {
-								fs.writeFileSync(path.join(dir, "AUDIT.json"), `${JSON.stringify({ at: new Date().toISOString(), ...audit }, null, 2)}\n`, "utf8")
+								fs.writeFileSync(path.join(problemAbs, "AUDIT.json"), `${JSON.stringify({ at: new Date().toISOString(), ...audit }, null, 2)}\n`, "utf8")
 							} catch {
 								/* state reporting is best-effort */
 							}
@@ -730,8 +908,11 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 				failure = error instanceof Error ? error.message : String(error)
 			} finally {
 				fs.rmSync(scratch, { recursive: true, force: true })
-				recordRun()
 			}
+
+			state = { ...state, status }
+			writeState(problemAbs, state)
+			recordRun()
 
 			const counts: Record<Mode, number> = { continue: 0, simplify: 0, experiment: 0, rederive: 0 }
 			for (const entry of trajectory) counts[entry.mode] += 1
@@ -739,9 +920,12 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 			const last = trajectory.length > 0 ? trajectory[trajectory.length - 1] : undefined
 			const text = renderSummary({
 				status,
-				problemDir,
+				problemDir: problemRel,
 				rounds: args.rounds,
 				done: trajectory.length,
+				completedRounds: state.completedRounds,
+				nextRound: state.nextRound,
+				resumedFrom,
 				modes,
 				lastQuestion: last === undefined ? undefined : clip(last.question, 300),
 				lastDecision: last === undefined ? undefined : clip(last.decision, 400),
@@ -753,9 +937,12 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 				content: [{ type: "text", text }],
 				details: {
 					status,
-					problemDir,
+					problemDir: problemRel,
 					rounds: args.rounds,
 					done: trajectory.length,
+					completedRounds: state.completedRounds,
+					nextRound: state.nextRound,
+					resumedFrom,
 					modes: counts,
 					audit,
 					failure,
