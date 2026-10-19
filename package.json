@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "arch_loop: fresh-context architecture-design search as a DSH tool",
+  "description": "ralph: resumable fresh-context loop (build/design) as a DSH tool",
   "exports": {
     ".": "./plugin.js",
     "./package.json": "./package.json"

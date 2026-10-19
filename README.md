@@ -1,162 +1,157 @@
 # ralphi
 
-`arch_loop` — a fresh-context architecture/design search, installed as a tool in
-both harnesses. One call creates the problem workspace, runs N design rounds
-with a new child agent each round, then one independent audit.
+`ralph` — one resumable fresh-context loop for both harnesses. Two protocols
+behind one argument:
 
-No manual setup: no template copying, no files to create, no workflow script to
-paste.
+| `kind` | Goal | Round | Final audit |
+|---|---|---|---|
+| `build` (default) | make a real change in a repo | one unit of work, verified and committed | independent verifier runs the project's checks against the goal |
+| `design` | find the simplest target architecture | one design investigation | independent implementability audit |
 
-| Harness | Integration | Child per round |
-|---|---|---|
-| DSH | Host plugin + `Coder & Organizer` preset row | in-process fresh subagent |
-| pi | extension package (`pi/extensions/arch-loop.ts`) | fresh `pi` child process |
+One call creates (or resumes) `docs/ralph/<slug>/` inside the project repository,
+runs N rounds with a fresh agent each round, then runs the audit. State is
+committed with the code; `STATE.json` survives interruption.
+
+No manual setup: no template copying, no files to create.
 
 ## Use
 
 ```
-arch_loop({ goal: "Design a bounded LRU cache with O(1) get/put ...", rounds: 24 })
+ralph({ goal: "Add cursor pagination to GET /items, tests included", rounds: 8 })
 ```
 
-Optional arguments:
+```
+ralph({ kind: "design", goal: "Design the module structure and data types for X", rounds: 16 })
+```
 
 | Argument | Meaning |
 |---|---|
-| `goal` | The problem. Requirements, constraints and non-goals when known. |
+| `goal` | Objective. For `build`: what must be true when done. For `design`: the problem, behavior, constraints, non-goals. |
+| `kind` | `build` (default) or `design`. |
 | `constraints` | Hard constraints only: bounds, compatibility, runtime, invariants. |
-| `paths` | Existing files/directories a refactor target must account for. |
-| `rounds` | Design rounds to run in this call. Default 24, ceiling 64 (`maxRounds` in config); later calls add more. |
-| `name` | Stable directory name. Reusing it resumes that problem. |
-| `project` | Repository root that owns `docs/arch-loop/`. Defaults to the git root containing the workspace, else the workspace. |
+| `paths` | Existing files/directories the work or design must account for. |
+| `rounds` | Rounds to run in this call. Default 24, ceiling 64; later calls add more. |
+| `name` | Stable directory name. Reusing it resumes that run. |
+| `project` | Repository root that owns `docs/ralph/`. Defaults to the git root containing the workspace, else the workspace. |
 
-The call is long-running and blocks the turn. Cancelling preserves every
-completed round; call again with the same `name` to continue.
+Long-running: the call blocks the turn. Cancelling preserves every completed
+round; call again with the same `name` and `goal` to continue.
 
 ## What it creates
 
-Inside the project repository, so the design record is versioned with the code
-and committed by the workers:
+Inside the project repository, so the record is versioned with the code and
+committed by the workers:
 
 ```
-docs/arch-loop/<slug>/
-  CONTRACT.md       goal + constraints + paths, written once; edit it to change the problem
-  ARCHITECTURE.md   best-known design; the worker replaces it only with evidence
-  QUESTIONS.md      material open questions
+docs/ralph/<slug>/
+  STATE.json        controller-owned resume marker (next / in-progress round)
+  rounds.jsonl      per-round reports (controller-owned)
+  runs.jsonl        one record per call (controller-owned)
+  AUDIT.json        independent verification result
+  rounds/           per-round report files (pi port)
   LOG.md            append-only per-round record
-  experiments/      prototypes, benchmarks, re-derivations
-  AUDIT.json        result of the independent audit
-  rounds/           per-round report files (pi port; `rNNN.json` + `audit.json`)
-  rounds.jsonl      structured per-round reports (controller-owned)
-  runs.jsonl        one record per arch_loop call (controller-owned)
-  STATE.json        controller-owned resume marker (next round, in-progress round)
 ```
 
-Workers commit the problem directory each round when the workspace is a git repo,
-so `git log` is the design history.
+`kind=design` additionally:
 
-## What each round does
+```
+  CONTRACT.md       goal + constraints + paths
+  ARCHITECTURE.md   best-known design; changes need evidence
+  QUESTIONS.md      material open questions
+  experiments/      prototypes, benchmarks, re-derivations
+```
 
-1. Reads `CONTRACT.md`, `QUESTIONS.md`, `LOG.md`, `ARCHITECTURE.md`.
-2. Writes three candidate questions, ranks them by materiality, pursues the most
-   material one.
-3. Picks a mode: `continue`, `simplify`, `experiment`, or `rederive`.
-   `rederive` reads the contract only and writes an independent design before
-   looking at the incumbent.
-4. Updates the files, commits, and returns a small structured report.
+`kind=build` additionally:
 
-The final audit is a fresh agent that reads only the contract and the
-architecture, tries to implement it, and reports the first place it must invent
-unspecified semantics. `AUDIT.json` is the convergence check, not the worker's
-opinion.
+```
+  GOAL.md           objective + constraints + paths
+  PLAN.md           current approach, done / next
+  NOTES.md          durable findings, commands, chosen interpretations
+  work/             scratch files
+```
+
+## What a round does
+
+`build`: read `GOAL.md`, `PLAN.md`, `NOTES.md`, `LOG.md`, inspect the repo and
+git status; pick the highest-value unit (or the smallest step that resolves the
+biggest unknown); implement it; run the project's checks and fix damage; commit;
+update the three files; report `{action, summary, evidence, next, blocked}`.
+The audit is a fresh verifier that runs the checks itself and returns
+`{satisfied, evidence, gaps}` — it does not trust the log.
+
+`design`: read the four design files; write three candidate questions, rank by
+materiality, pursue the most material one; choose `continue`, `simplify`,
+`experiment`, or `rederive` (contract-only, independent design first); update
+the files, commit, report `{mode, question, evidence, decision, next}`. The audit
+tries to implement the contract and reports the first place it must invent
+semantics.
 
 ## Resume
 
-`STATE.json` is rewritten atomically after every round, before and after each
-child runs. If DSH or the machine stops mid-call, call `arch_loop` again with the
-same `name` and `goal`:
+`STATE.json` is written atomically before and after every round. If the harness
+or the machine stops mid-call, call again with the same `name`, `kind`, and
+`goal`:
 
 - completed rounds are never repeated;
 - a round whose report was already written is ingested instead of re-run (pi);
-- a round that was interrupted mid-flight is retried from `STATE.inProgress`;
-- rounds continue numbering upward, and `rounds` is the budget for this call.
-
-A later call with the same `name` but a different `goal` is rejected, so a
-resumed run cannot silently drift. Use a new name, or delete
-`docs/arch-loop/<slug>/`, to start over.
+- a round interrupted mid-flight is retried at the same number;
+- the interrupted round is the resume granularity, not the conversation;
+- the same name with a different goal or kind is rejected instead of mixed.
 
 ## Reviewing a run
 
 ```sh
-git log --oneline -- docs/arch-loop/<slug>
-git diff <start>.. -- docs/arch-loop/<slug>/ARCHITECTURE.md
+git log --oneline -- docs/ralph/<slug>
+git diff <start>.. -- docs/ralph/<slug>/
 ```
 
-Then read `ARCHITECTURE.md`, `QUESTIONS.md`, and `AUDIT.json`. Useful signals:
-
-- all rounds `continue`, no `simplify`/`rederive` → the loop is polishing
-- `AUDIT.json` material → reopen with a follow-up run
-- rounds stop adding material questions → kill the job (`job_kill`); state is
-  already committed
+`kind=build`: read `AUDIT.json` first — `satisfied=false` means the goal was not
+met, `gaps` says what is missing. `kind=design`: `AUDIT.json` `material=true`
+means the design still has an implementability gap.
 
 ## Install / update
 
-Installed in profile `web` as the bundle `@local/dsh-plugin-arch-loop`
-(`/home/cedric/dev/ralphi` is linked into the profile). It is registered twice,
-deliberately:
+Both harnesses register the same tool name, `ralph`.
 
-- host scope, from this bundle's `cordis.patch.yml` — available to every agent;
-- `Coder & Organizer` preset (`preset-coder`), inside the user's
-  `dsh-presets/coder-preset` package — the tool belongs to that agent's
-  composition. Scoped registration shadows the global one for that agent.
+### DSH
+
+Profile `web`, bundle `@local/dsh-plugin-arch-loop` (the package name is
+historical; it now provides `ralph`). Registered twice:
+
+- host scope — available to every agent;
+- `Coder & Organizer` preset — the built-in `tool-ralph` row is disabled there,
+  because the scoped built-in would shadow this tool.
 
 After editing `plugin.js` or either patch, restart DSH: the live process imports
-each module generation once, and an entry that failed to import cannot recover.
+a module generation once.
 
-Config lives in `cordis.patch.yml`:
+Config in `cordis.patch.yml`:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `provider` | `spawn` | Fresh subagent provider. Must support structured output and not inherit context. |
+| `provider` | `spawn` | Fresh subagent provider; must support structured output. |
 | `maxRounds` | `64` | Per-call ceiling. |
 | `defaultRounds` | `24` | Used when `rounds` is omitted. |
 
 ### pi
 
-The extension lives in [`pi/`](pi/): `pi/package.json` declares the package, and
-`pi/extensions/arch-loop.ts` registers the same tool.
+Extension in [`pi/`](pi/). Install:
 
 ```sh
 pi install /home/cedric/dev/ralphi/pi
 ```
 
-Each round spawns `pi --mode json -p --no-session --no-extensions --no-skills
---no-prompt-templates --tools read,write,edit,bash,grep,find,ls
---append-system-prompt <worker.md>`, in the project root and inheriting the
-parent model and thinking level. The worker writes `rounds/rNNN.json`; the tool
-validates that file, so no assistant prose is parsed. The audit writes
-`rounds/audit.json`.
-
-In the TUI the call renders as the goal plus round count, rounds stream as
-progress lines, the collapsed result shows status, mode mix and the audit
-verdict, and the expanded view (Ctrl+O) adds the audit consequence, the state
-path, and token/cost usage. The system prompt advertises the tool through its
-snippet and guidelines, and calls are serialised so two loops cannot fight over
-one problem directory.
-
-Pi loads extensions once at startup; after editing the extension, `/reload` in an
-interactive session (or restart) picks it up.
-
-`arch_loop` is installed globally in `~/.pi/agent/settings.json`. To scope it to
-one project instead, `pi install -l /home/cedric/dev/ralphi/pi` from that
-project.
+Each round spawns a fresh `pi` child with built-in tools only
+(`read,write,edit,bash,grep,find,ls`), in the project root, inheriting the
+parent model and thinking level. The child writes `rounds/rNNN.json`; the tool
+validates it. `/reload` after editing.
 
 ## Deliberate limits
 
-- A round is the resume granularity: work done by a child that dies mid-round is
-  lost and that round is retried, not resumed mid-conversation.
-- `rederive` blindness is procedural, not enforced.
-- Only the final audit is independent of the search; there is no per-round
-  auditor.
-- No token budget; round count is the only spend control.
-
-Add machinery only when one of these breaks a run in practice.
+- Round is the resume granularity: a child that dies mid-round is retried, not
+  continued mid-conversation.
+- `rederive` blindness (design) is procedural, not enforced.
+- No per-round wall-clock timeout yet; interrupt and resume is the control.
+- One auditor/verifier, not an adversarial panel.
+- Completion is a per-call budget plus an audit verdict; no auto-continuation
+  after a restart — re-invoke with the same name and goal.

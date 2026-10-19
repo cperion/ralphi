@@ -1,14 +1,18 @@
 /**
- * arch_loop for pi — fresh-context architecture design search as one tool.
+ * ralph for pi — one resumable fresh-context loop exposed as one tool, with two
+ * protocols behind `kind`:
  *
- * One call scaffolds `docs/arch-loop/<slug>/` inside the project repository,
- * runs N design rounds each in a fresh
- * `pi` child process, then one independent audit. The problem directory is the
- * only memory between rounds: no conversation is carried over.
+ *   kind: "design"  search for the simplest, clearest target design/architecture
+ *   kind: "build"   do real work in the repository, one verified unit per round
  *
- * Port of the DSH `arch_loop` plugin. The report protocol is file-based
- * (`rounds/rNNN.json`, `rounds/audit.json`) so the parent never has to parse
- * assistant prose.
+ * One call creates (or resumes) `docs/ralph/<slug>/` inside the project
+ * repository, runs N rounds each in a fresh `pi` child process, then one
+ * independent audit. STATE.json is written atomically before and after every
+ * round, so an interrupted call continues at the next round when called again
+ * with the same name and goal.
+ *
+ * Report protocol is file-based (`rounds/rNNN.json`, `rounds/audit.json`) so the
+ * parent never parses assistant prose.
  *
  * @module @local/pi-arch-loop
  */
@@ -25,24 +29,46 @@ const MAX_ROUNDS = 64
 const DEFAULT_ROUNDS = 24
 const MAX_CAPTURED_STDERR = 8192
 
-const REPORT_FIELDS = ["mode", "question", "evidence", "decision", "next"] as const
-const MODES = ["continue", "simplify", "experiment", "rederive"] as const
+const KINDS = ["design", "build"] as const
+type Kind = (typeof KINDS)[number]
 
-type Mode = (typeof MODES)[number]
+const DESIGN_MODES = ["continue", "simplify", "experiment", "rederive"] as const
+type DesignMode = (typeof DESIGN_MODES)[number]
 
-interface RoundReport {
-	mode: Mode
+const BUILD_ACTIONS = ["implement", "fix", "test", "refactor", "investigate", "docs"] as const
+type BuildAction = (typeof BUILD_ACTIONS)[number]
+
+interface DesignReport {
+	mode: DesignMode
 	question: string
 	evidence: string[]
 	decision: string
 	next: string
 }
 
-interface AuditReport {
+interface BuildReport {
+	action: BuildAction
+	summary: string
+	evidence: string[]
+	next: string
+	blocked: string
+}
+
+type RoundReport = DesignReport | BuildReport
+
+interface DesignAudit {
 	material: boolean
 	finding: string
 	consequence: string
 }
+
+interface BuildAudit {
+	satisfied: boolean
+	evidence: string[]
+	gaps: string[]
+}
+
+type AuditReport = DesignAudit | BuildAudit
 
 interface Usage {
 	input: number
@@ -54,28 +80,77 @@ interface Usage {
 }
 
 /** Details shape carried to the TUI renderer. */
-interface ArchLoopDetails {
+interface RalphDetails {
+	kind?: Kind
 	phase?: "round" | "audit"
 	round?: number
 	rounds?: number
-	mode?: string
 	status?: string
 	problemDir?: string
 	done?: number
 	completedRounds?: number
 	nextRound?: number
 	resumedFrom?: number
-	modes?: Record<string, number>
+	plan?: string
 	audit?: AuditReport
 	failure?: string
 	usage?: Usage
 }
 
-const WORKER_PERSONA = `You are an architecture designer and adversarial simplifier. You search for the smallest set of concepts, states, invariants and representations that satisfies the contract. You do not write production code; a prototype, test or benchmark exists only to answer a question. You treat the current design, including your own previous rounds, as a hypothesis, not as a baseline to defend.`
+interface RalphArgs {
+	goal: string
+	kind: Kind
+	constraints?: string
+	paths: string[]
+	rounds: number
+	project?: string
+	slug: string
+}
 
-const AUDITOR_PERSONA = `You are an independent design auditor. You have not seen the search process. You judge only the contract and the written architecture, and you look for the first place an implementer would have to invent semantics the design did not specify.`
+/** Controller-owned resume marker, rewritten atomically after every round. */
+interface RunState {
+	version: number
+	kind: Kind
+	slug: string
+	goal: string
+	nextRound: number
+	completedRounds: number
+	status: string
+	inProgress: number | null
+	updatedAt?: string
+}
 
-const WORKER_PROTOCOL = `You are one iteration of an architecture-design loop. You have no memory of previous rounds beyond the files in the problem directory.
+interface Profile {
+	kind: Kind
+	workerPrompt: string
+	auditorPrompt: string
+	ensureState(dir: string, args: RalphArgs): void
+	roundPrompt(problemAbs: string, projectRoot: string, problemRel: string, round: number, previous: RoundReport | undefined, reportAbs: string): string
+	auditPrompt(problemAbs: string, reportAbs: string): string
+	readReport(filePath: string): { value?: RoundReport; error?: string }
+	readAudit(filePath: string): { value?: AuditReport; error?: string }
+	describePlan(entries: RoundReport[]): string
+	auditLines(audit: AuditReport): string[]
+	roundLine(entry: RoundReport): string
+}
+
+// ---------------------------------------------------------------------------
+// Personas and protocols
+// ---------------------------------------------------------------------------
+
+const DESIGN_WORKER_PERSONA =
+	"You are an architecture designer and adversarial simplifier. You search for the smallest set of concepts, states, invariants and representations that satisfies the contract. You do not write production code; a prototype, test or benchmark exists only to answer a question. You treat the current design, including your own previous rounds, as a hypothesis, not as a baseline to defend."
+
+const DESIGN_AUDITOR_PERSONA =
+	"You are an independent design auditor. You have not seen the search process. You judge only the contract and the written architecture, and you look for the first place an implementer would have to invent semantics the design did not specify."
+
+const BUILD_WORKER_PERSONA =
+	"You are a careful software engineer working one verified unit at a time. You inspect before changing, keep changes focused, run the project checks, and never claim a result you did not observe. You treat the goal as fixed and record ambiguity instead of inventing requirements."
+
+const BUILD_VERIFIER_PERSONA =
+	"You are an independent verifier. You have not seen the work process. You judge only the goal and the actual repository state, and you trust observed commands over written claims."
+
+const DESIGN_PROTOCOL = `You are one iteration of an architecture-design loop. You have no memory of previous rounds beyond the files in the problem directory.
 
 Read, in this order: CONTRACT.md, QUESTIONS.md, LOG.md (the tail is enough), ARCHITECTURE.md.
 
@@ -101,7 +176,7 @@ Do not delegate, build tooling, or invent progress. A round that only eliminates
 Your final action must be writing the round report JSON file named in the user message, with exactly these fields and nothing else:
 {"mode": "continue|simplify|experiment|rederive", "question": "string", "evidence": ["path or result"], "decision": "string", "next": "string"}`
 
-const AUDIT_PROTOCOL = `Independent audit. You have not seen this search. Read only CONTRACT.md and ARCHITECTURE.md in the problem directory.
+const DESIGN_AUDIT_PROTOCOL = `Independent audit. You have not seen this search. Read only CONTRACT.md and ARCHITECTURE.md in the problem directory.
 
 Attempt to implement the essential required behavior from those documents alone. Every time you must invent a semantic decision the design did not specify, note it. Then judge whether one material gap remains: an omission that changes correctness, a representation that forces accidental complexity, or a simpler formulation the design missed.
 
@@ -110,10 +185,50 @@ material=false only if you could implement the contract without inventing anythi
 Your final action must be writing the audit JSON file named in the user message, with exactly these fields and nothing else:
 {"material": true|false, "finding": "string", "consequence": "string"}`
 
-const CONTRACT_RULES = `## Rules for this search
+const BUILD_PROTOCOL = `You are one iteration of a work loop on a real repository. You have no memory of previous rounds beyond the files in the problem directory.
+
+Read, in this order: GOAL.md, PLAN.md, NOTES.md, LOG.md, then inspect the repository and its git status.
+
+Do exactly one unit of work that advances the goal:
+- pick the highest-value step from PLAN.md, or the smallest step that resolves the biggest unknown;
+- if the goal is ambiguous, take the cheapest defensible interpretation and record it in NOTES.md instead of inventing silently;
+- keep changes focused; do not rewrite unrelated code;
+- run the project's checks (tests, build, linter) and fix what you broke; never report success you did not observe;
+- commit the work with a focused message.
+
+Update PLAN.md (done / next), append one dense section to LOG.md, and record durable findings or commands in NOTES.md. Keep scratch work in work/.
+
+Do not delegate, do not build tooling beyond what the task needs, and do not claim progress you cannot evidence.
+
+Actions: implement | fix | test | refactor | investigate | docs.
+
+Your final action must be writing the round report JSON file named in the user message, with exactly these fields and nothing else:
+{"action": "implement|fix|test|refactor|investigate|docs", "summary": "string", "evidence": ["command or file"], "next": "string", "blocked": ""}`
+
+const BUILD_AUDIT_PROTOCOL = `Independent verification. You have not seen the work process. Read GOAL.md and inspect the repository. Do not trust PLAN.md or LOG.md.
+
+Check whether the goal is satisfied:
+- run the project's checks (tests, build, linter) yourself;
+- inspect the actual code and the uncommitted diff, not just committed history;
+- list concrete gaps, each with why the criterion fails.
+
+satisfied=true only if the goal's criteria are met and you observed the evidence. evidence: commands run and their results. gaps: concrete unmet criteria, empty when satisfied.
+
+Your final action must be writing the audit JSON file named in the user message, with exactly these fields and nothing else:
+{"satisfied": true|false, "evidence": ["command and result"], "gaps": ["string"]}`
+
+// ---------------------------------------------------------------------------
+// Templates
+// ---------------------------------------------------------------------------
+
+const DESIGN_CONTRACT_RULES = `## Rules for this search
 - Required behavior, observed legacy behavior, confirmed constraints, assumptions and preferences are distinct. Do not promote one into another.
 - Missing requirements are open questions, never inventions.
 - Definition of done: every stated requirement is accounted for, no unresolved material question remains, and an implementer can build the design without inventing semantics.`
+
+const BUILD_GOAL_RULES = `## Rules for this work
+- The goal is fixed. Missing requirements are recorded in NOTES.md and gaps in the final verification, never invented silently.
+- Definition of done: the goal's criteria are met and verified by running the project's own checks.`
 
 const ARCHITECTURE_TEMPLATE = `# Architecture
 
@@ -157,41 +272,37 @@ number of concepts, or violate a requirement? Keep only material questions.
 | 1 |          | high        | open   |          |
 `
 
+const PLAN_TEMPLATE = `# Plan
+
+Status: not started.
+
+Keep this current: what the approach is, what is done, what is next. Do not use
+it as a diary; the round-by-round record belongs in \`LOG.md\`.
+
+## Approach
+
+## Steps
+- [ ] 
+
+## Next
+`
+
+const NOTES_TEMPLATE = `# Notes
+
+Durable findings only: decisions, constraints discovered in the repository,
+commands that matter, and ambiguities with the interpretation chosen. Append;
+do not rewrite history.
+`
+
 const LOG_HEADER = `# Log
 
 Append only, newest last. One dense section per round. Point at evidence rather
 than copying it.
 `
 
-interface ArchLoopArgs {
-	goal: string
-	constraints?: string
-	paths: string[]
-	rounds: number
-	project?: string
-	slug: string
-}
-
-/** Controller-owned resume marker, rewritten atomically after every round. */
-interface RunState {
-	version: number
-	slug: string
-	goal: string
-	nextRound: number
-	completedRounds: number
-	status: string
-	inProgress: number | null
-	updatedAt?: string
-}
-
-interface ChildResult {
-	ok: boolean
-	code: number
-	stderr: string
-	usage: Usage
-	stopReason?: string
-	errorMessage?: string
-}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 function emptyUsage(): Usage {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 }
@@ -227,132 +338,67 @@ function textOf(content: Array<{ type: string; text?: string }>): string {
 		.join("\n")
 }
 
-function renderCall(args: Record<string, unknown>, theme: Theme) {
-	const goal = clip(args?.goal, 72)
-	const rounds = typeof args?.rounds === "number" ? args.rounds : DEFAULT_ROUNDS
-	return new Text(
-		`${theme.fg("toolTitle", theme.bold("arch_loop"))} ${theme.fg("accent", goal)} ${theme.fg("muted", `· ${rounds} rounds`)}`,
-		0,
-		0,
-	)
-}
-
-function renderResult(
-	result: { content: Array<{ type: string; text?: string }>; details?: ArchLoopDetails },
-	options: { expanded: boolean; isPartial: boolean },
-	theme: Theme,
-) {
-	const details = result.details
-	if (options.isPartial || details?.status === undefined) {
-		const progress = textOf(result.content)
-		return new Text(theme.fg("muted", progress.length > 0 ? progress : "running…"), 0, 0)
-	}
-
-	const ok = details.status === "complete"
-	const icon = ok ? theme.fg("success", "✓") : theme.fg("error", "✗")
-	const progress = details.completedRounds === undefined
-		? `${details.done ?? 0}/${details.rounds ?? 0}`
-		: `${details.done ?? 0}/${details.rounds ?? 0} this call · ${details.completedRounds} total`
-	const lines: string[] = [
-		`${icon} ${theme.fg("toolTitle", theme.bold("arch_loop"))} ${theme.fg("muted", details.status)} ${theme.fg("accent", progress)} ${theme.fg("muted", "rounds")}`,
-	]
-
-	if (details.modes) {
-		const modes = details.modes
-		lines.push(
-			theme.fg(
-				"muted",
-				`modes  ${modes.continue ?? 0} continue · ${modes.simplify ?? 0} simplify · ${modes.experiment ?? 0} experiment · ${modes.rederive ?? 0} rederive`,
-			),
-		)
-	}
-
-	if (details.audit) {
-		if (details.audit.material) {
-			lines.push(
-				theme.fg("warning", "audit  MATERIAL GAP — ") +
-					theme.fg("text", clip(details.audit.finding, options.expanded ? 4000 : 110)),
-			)
-			if (options.expanded) lines.push(theme.fg("muted", `consequence  ${details.audit.consequence}`))
-		} else {
-			lines.push(theme.fg("success", "audit  no material gap"))
-		}
-	}
-
-	if (details.failure) {
-		lines.push(theme.fg("error", `failure  ${clip(details.failure, options.expanded ? 4000 : 140)}`))
-	}
-
-	if (options.expanded) {
-		lines.push("")
-		if (details.resumedFrom !== undefined) lines.push(theme.fg("muted", `resumed    from round ${details.resumedFrom}`))
-		if (details.problemDir) {
-			lines.push(
-				theme.fg("muted", "state      ") +
-					theme.fg("accent", `${details.problemDir}/{ARCHITECTURE.md,QUESTIONS.md,LOG.md,STATE.json}`),
-			)
-		}
-		if (details.nextRound !== undefined) lines.push(theme.fg("muted", `next       continues at round ${details.nextRound}`))
-		if (details.usage) {
-			const usage = details.usage
-			lines.push(
-				theme.fg(
-					"muted",
-					`usage      ${usage.turns ?? 0} turns · ↑${formatTokens(usage.input)} ↓${formatTokens(usage.output)} · $${(usage.cost ?? 0).toFixed(4)}`,
-				),
-			)
-		}
-	}
-
-	return new Text(lines.join("\n"), 0, 0)
-}
-
-function readArgs(raw: Record<string, unknown>, maxRounds: number, defaultRounds: number): ArchLoopArgs {
+function readArgs(raw: Record<string, unknown>, maxRounds: number, defaultRounds: number): RalphArgs {
 	const goal = typeof raw.goal === "string" ? raw.goal.trim() : ""
-	if (goal.length === 0) throw new Error("arch_loop: goal must be a non-empty string")
+	if (goal.length === 0) throw new Error("ralph: goal must be a non-empty string")
+	const kind = raw.kind === undefined ? "build" : raw.kind
+	if (typeof kind !== "string" || !(KINDS as readonly string[]).includes(kind)) {
+		throw new Error(`ralph: kind must be one of ${KINDS.join(", ")}`)
+	}
 	const constraints = typeof raw.constraints === "string" && raw.constraints.trim().length > 0 ? raw.constraints.trim() : undefined
-	if (raw.paths !== undefined && !Array.isArray(raw.paths)) throw new Error("arch_loop: paths must be an array of strings")
+	if (raw.paths !== undefined && !Array.isArray(raw.paths)) throw new Error("ralph: paths must be an array of strings")
 	const paths = (raw.paths as unknown[] | undefined ?? []).filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
 	const rounds = raw.rounds === undefined ? defaultRounds : raw.rounds
 	if (typeof rounds !== "number" || !Number.isSafeInteger(rounds) || rounds < 1 || rounds > maxRounds) {
-		throw new Error(`arch_loop: rounds must be an integer between 1 and ${maxRounds}`)
+		throw new Error(`ralph: rounds must be an integer between 1 and ${maxRounds}`)
 	}
 	const project = typeof raw.project === "string" && raw.project.trim().length > 0 ? raw.project.trim() : undefined
 	const name = typeof raw.name === "string" && raw.name.trim().length > 0 ? raw.name.trim() : goal
-	return { goal, constraints, paths, rounds, project, slug: slugify(name) }
+	return { goal, kind: kind as Kind, constraints, paths, rounds, project, slug: slugify(name) }
 }
 
-function contractText(args: ArchLoopArgs): string {
-	const pathList = args.paths.length === 0 ? "None specified." : args.paths.map((p) => `- \`${p}\``).join("\n")
-	const constraintText = args.constraints === undefined
-		? "None stated. Treat any missing requirement as an open question in QUESTIONS.md; do not invent behavior."
-		: args.constraints
+function pathList(paths: string[]): string {
+	return paths.length === 0 ? "None specified." : paths.map((entry) => `- \`${entry}\``).join("\n")
+}
+
+function constraintText(constraints: string | undefined): string {
+	return constraints === undefined
+		? "None stated. Treat any missing requirement as an open question in the notes; do not invent behavior."
+		: constraints
+}
+
+function designContractText(args: RalphArgs): string {
 	return `# Contract
 
 ## Problem
 ${args.goal}
 
 ## Constraints
-${constraintText}
+${constraintText(args.constraints)}
 
 ## Existing code
-${pathList}
+${pathList(args.paths)}
 
-${CONTRACT_RULES}
+${DESIGN_CONTRACT_RULES}
+`
+}
+
+function buildGoalText(args: RalphArgs): string {
+	return `# Goal
+${args.goal}
+
+## Constraints
+${constraintText(args.constraints)}
+
+## Paths
+${pathList(args.paths)}
+
+${BUILD_GOAL_RULES}
 `
 }
 
 function ensureFile(filePath: string, text: string): void {
 	if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, text, "utf8")
-}
-
-function ensureState(dir: string, args: ArchLoopArgs): void {
-	fs.mkdirSync(path.join(dir, "experiments"), { recursive: true })
-	fs.mkdirSync(path.join(dir, "rounds"), { recursive: true })
-	ensureFile(path.join(dir, "CONTRACT.md"), contractText(args))
-	ensureFile(path.join(dir, "ARCHITECTURE.md"), ARCHITECTURE_TEMPLATE)
-	ensureFile(path.join(dir, "QUESTIONS.md"), QUESTIONS_TEMPLATE)
-	ensureFile(path.join(dir, "LOG.md"), LOG_HEADER)
 }
 
 const STATE_FILE = "STATE.json"
@@ -377,7 +423,7 @@ function resolveProjectRoot(rawProject: string | undefined, workspace: string): 
 	if (rawProject !== undefined) {
 		const candidate = path.resolve(workspace, rawProject)
 		if (!fs.existsSync(candidate) || !fs.statSync(candidate).isDirectory()) {
-			throw new Error(`arch_loop: project path is not a directory: ${candidate}`)
+			throw new Error(`ralph: project path is not a directory: ${candidate}`)
 		}
 		return candidate
 	}
@@ -407,16 +453,8 @@ function readLastReport(dir: string): RoundReport | undefined {
 	const lines = fs.readFileSync(file, "utf8").trim().split("\n")
 	for (let index = lines.length - 1; index >= 0; index -= 1) {
 		try {
-			const entry = JSON.parse(lines[index]) as RoundReport & { round?: number }
-			if (entry !== null && typeof entry === "object" && typeof entry.mode === "string") {
-				return {
-					mode: entry.mode,
-					question: entry.question,
-					evidence: entry.evidence,
-					decision: entry.decision,
-					next: entry.next,
-				}
-			}
+			const entry = JSON.parse(lines[index]) as RoundReport
+			if (entry !== null && typeof entry === "object") return entry
 		} catch {
 			/* skip malformed line */
 		}
@@ -447,6 +485,195 @@ function padRound(round: number): string {
 	return String(round).padStart(3, "0")
 }
 
+function isStringArray(value: unknown): value is string[] {
+	return Array.isArray(value) && value.every((entry) => typeof entry === "string")
+}
+
+function readJsonObject(filePath: string, label: string): { value?: Record<string, unknown>; error?: string } {
+	let parsed: unknown
+	try {
+		parsed = JSON.parse(fs.readFileSync(filePath, "utf8"))
+	} catch (error) {
+		return { error: `${label} file missing or unreadable: ${error instanceof Error ? error.message : String(error)}` }
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return { error: `${label} is not an object` }
+	return { value: parsed as Record<string, unknown> }
+}
+
+function validateDesignReport(record: Record<string, unknown>): { value?: RoundReport; error?: string } {
+	if (!(DESIGN_MODES as readonly string[]).includes(record.mode as string)) {
+		return { error: `report.mode is not one of ${DESIGN_MODES.join(", ")}` }
+	}
+	for (const field of ["question", "decision", "next"] as const) {
+		if (typeof record[field] !== "string") return { error: `report.${field} must be a string` }
+	}
+	if (!isStringArray(record.evidence)) return { error: "report.evidence must be an array of strings" }
+	return { value: record as unknown as DesignReport }
+}
+
+function validateBuildReport(record: Record<string, unknown>): { value?: RoundReport; error?: string } {
+	if (!(BUILD_ACTIONS as readonly string[]).includes(record.action as string)) {
+		return { error: `report.action is not one of ${BUILD_ACTIONS.join(", ")}` }
+	}
+	for (const field of ["summary", "next", "blocked"] as const) {
+		if (typeof record[field] !== "string") return { error: `report.${field} must be a string` }
+	}
+	if (!isStringArray(record.evidence)) return { error: "report.evidence must be an array of strings" }
+	return { value: record as unknown as BuildReport }
+}
+
+function validateDesignAudit(record: Record<string, unknown>): { value?: AuditReport; error?: string } {
+	if (typeof record.material !== "boolean") return { error: "audit.material must be a boolean" }
+	if (typeof record.finding !== "string") return { error: "audit.finding must be a string" }
+	let consequence = ""
+	if (typeof record.consequence === "string") consequence = record.consequence
+	else if (record.material) return { error: "audit.consequence must be a string when material is true" }
+	return { value: { material: record.material, finding: record.finding, consequence } }
+}
+
+function validateBuildAudit(record: Record<string, unknown>): { value?: AuditReport; error?: string } {
+	if (typeof record.satisfied !== "boolean") return { error: "audit.satisfied must be a boolean" }
+	if (!isStringArray(record.evidence)) return { error: "audit.evidence must be an array of strings" }
+	if (!isStringArray(record.gaps)) return { error: "audit.gaps must be an array of strings" }
+	return { value: { satisfied: record.satisfied, evidence: record.evidence, gaps: record.gaps } }
+}
+
+// ---------------------------------------------------------------------------
+// Profiles
+// ---------------------------------------------------------------------------
+
+const DESIGN_PROFILE: Profile = {
+	kind: "design",
+	workerPrompt: `${DESIGN_WORKER_PERSONA}\n\n${DESIGN_PROTOCOL}\n`,
+	auditorPrompt: `${DESIGN_AUDITOR_PERSONA}\n\n${DESIGN_AUDIT_PROTOCOL}\n`,
+	ensureState(dir, args) {
+		fs.mkdirSync(path.join(dir, "experiments"), { recursive: true })
+		fs.mkdirSync(path.join(dir, "rounds"), { recursive: true })
+		ensureFile(path.join(dir, "CONTRACT.md"), designContractText(args))
+		ensureFile(path.join(dir, "ARCHITECTURE.md"), ARCHITECTURE_TEMPLATE)
+		ensureFile(path.join(dir, "QUESTIONS.md"), QUESTIONS_TEMPLATE)
+		ensureFile(path.join(dir, "LOG.md"), LOG_HEADER)
+	},
+	roundPrompt(problemAbs, projectRoot, problemRel, round, previous, reportAbs) {
+		const prior = previous === undefined
+			? "No previous round report exists: ARCHITECTURE.md may still have no candidate."
+			: `Previous round report: ${JSON.stringify(previous)}`
+		return `Problem directory: ${problemAbs}
+Files: ${problemAbs}/CONTRACT.md, ${problemAbs}/QUESTIONS.md, ${problemAbs}/LOG.md, ${problemAbs}/ARCHITECTURE.md
+
+Round ${round}. ${prior}
+
+Prefix experiment files with the round number. Keep everything inside the problem directory.
+
+Write your round report to: ${reportAbs}
+Overwrite that file if it exists. Then, if the project is a git repository, commit only this directory:
+git -C "${projectRoot}" add "${problemRel}" && git -C "${projectRoot}" commit -m "ralph design round ${round}"`
+	},
+	auditPrompt(problemAbs, reportAbs) {
+		return `Problem directory: ${problemAbs}
+Read only: ${problemAbs}/CONTRACT.md and ${problemAbs}/ARCHITECTURE.md
+
+Write your audit report to: ${reportAbs}
+Overwrite that file if it exists.`
+	},
+	readReport(filePath) {
+		const parsed = readJsonObject(filePath, "report")
+		if (parsed.error !== undefined) return { error: parsed.error }
+		return validateDesignReport(parsed.value as Record<string, unknown>)
+	},
+	readAudit(filePath) {
+		const parsed = readJsonObject(filePath, "audit")
+		if (parsed.error !== undefined) return { error: parsed.error }
+		return validateDesignAudit(parsed.value as Record<string, unknown>)
+	},
+	describePlan(entries) {
+		const counts: Record<DesignMode, number> = { continue: 0, simplify: 0, experiment: 0, rederive: 0 }
+		for (const entry of entries as DesignReport[]) counts[entry.mode] += 1
+		return `${counts.continue} continue · ${counts.simplify} simplify · ${counts.experiment} experiment · ${counts.rederive} rederive`
+	},
+	auditLines(audit) {
+		const value = audit as DesignAudit
+		const lines = [value.material ? `audit  MATERIAL GAP — ${value.finding}` : `audit  no material gap — ${value.finding}`]
+		if (value.material) lines.push(`consequence  ${value.consequence}`)
+		return lines
+	},
+	roundLine(entry) {
+		const value = entry as DesignReport
+		return `${value.mode} — ${value.question} → ${value.decision}`
+	},
+}
+
+const BUILD_PROFILE: Profile = {
+	kind: "build",
+	workerPrompt: `${BUILD_WORKER_PERSONA}\n\n${BUILD_PROTOCOL}\n`,
+	auditorPrompt: `${BUILD_VERIFIER_PERSONA}\n\n${BUILD_AUDIT_PROTOCOL}\n`,
+	ensureState(dir, args) {
+		fs.mkdirSync(path.join(dir, "work"), { recursive: true })
+		fs.mkdirSync(path.join(dir, "rounds"), { recursive: true })
+		ensureFile(path.join(dir, "GOAL.md"), buildGoalText(args))
+		ensureFile(path.join(dir, "PLAN.md"), PLAN_TEMPLATE)
+		ensureFile(path.join(dir, "NOTES.md"), NOTES_TEMPLATE)
+		ensureFile(path.join(dir, "LOG.md"), LOG_HEADER)
+	},
+	roundPrompt(problemAbs, projectRoot, problemRel, round, previous, reportAbs) {
+		const prior = previous === undefined
+			? "No previous round report exists: this is the first round."
+			: `Previous round report: ${JSON.stringify(previous)}`
+		return `Problem directory: ${problemAbs}
+Files: ${problemAbs}/GOAL.md, ${problemAbs}/PLAN.md, ${problemAbs}/NOTES.md, ${problemAbs}/LOG.md
+Workspace: the project repository at ${projectRoot}
+
+Round ${round}. ${prior}
+
+Keep scratch files in ${problemAbs}/work/. Commit your work in the project repository; this directory is in the repository and should be committed with it.
+
+Write your round report to: ${reportAbs}
+Overwrite that file if it exists. Then commit:
+git -C "${projectRoot}" add -A && git -C "${projectRoot}" commit -m "ralph build round ${round}"`
+	},
+	auditPrompt(problemAbs, reportAbs) {
+		return `Goal file: ${problemAbs}/GOAL.md
+Workspace: the project repository containing ${problemAbs}
+
+Write your audit report to: ${reportAbs}
+Overwrite that file if it exists.`
+	},
+	readReport(filePath) {
+		const parsed = readJsonObject(filePath, "report")
+		if (parsed.error !== undefined) return { error: parsed.error }
+		return validateBuildReport(parsed.value as Record<string, unknown>)
+	},
+	readAudit(filePath) {
+		const parsed = readJsonObject(filePath, "audit")
+		if (parsed.error !== undefined) return { error: parsed.error }
+		return validateBuildAudit(parsed.value as Record<string, unknown>)
+	},
+	describePlan(entries) {
+		const counts: Record<BuildAction, number> = { implement: 0, fix: 0, test: 0, refactor: 0, investigate: 0, docs: 0 }
+		for (const entry of entries as BuildReport[]) counts[entry.action] += 1
+		return BUILD_ACTIONS.map((action) => `${counts[action]} ${action}`).join(" · ")
+	},
+	auditLines(audit) {
+		const value = audit as BuildAudit
+		if (value.satisfied) {
+			const evidence = value.evidence.length === 0 ? "no evidence recorded" : clip(value.evidence.join("; "), 300)
+			return [`audit  GOAL MET — ${evidence}`]
+		}
+		const gaps = value.gaps.length === 0 ? "no gaps listed" : clip(value.gaps.join("; "), 400)
+		return [`audit  NOT MET — ${gaps}`]
+	},
+	roundLine(entry) {
+		const value = entry as BuildReport
+		return `${value.action} — ${value.summary}${value.blocked ? ` (blocked: ${value.blocked})` : ""}`
+	},
+}
+
+const PROFILES: Record<Kind, Profile> = { design: DESIGN_PROFILE, build: BUILD_PROFILE }
+
+// ---------------------------------------------------------------------------
+// Child process
+// ---------------------------------------------------------------------------
+
 /** Invoke the running pi binary rather than assuming `pi` is on PATH. */
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	const currentScript = process.argv[1]
@@ -458,6 +685,15 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName)
 	if (!isGenericRuntime) return { command: process.execPath, args }
 	return { command: "pi", args }
+}
+
+interface ChildResult {
+	ok: boolean
+	code: number
+	stderr: string
+	usage: Usage
+	stopReason?: string
+	errorMessage?: string
 }
 
 function runChild(options: {
@@ -551,151 +787,129 @@ function runChild(options: {
 	})
 }
 
-function readRoundReport(filePath: string): { value?: RoundReport; error?: string } {
-	let parsed: unknown
-	try {
-		parsed = JSON.parse(fs.readFileSync(filePath, "utf8"))
-	} catch (error) {
-		return { error: `report file missing or unreadable: ${error instanceof Error ? error.message : String(error)}` }
-	}
-	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return { error: "report is not an object" }
-	const record = parsed as Record<string, unknown>
-	for (const field of REPORT_FIELDS) if (!(field in record)) return { error: `report is missing field "${field}"` }
-	if (!MODES.includes(record.mode as Mode)) return { error: `report.mode is not one of ${MODES.join(", ")}` }
-	for (const field of ["question", "decision", "next"] as const) {
-		if (typeof record[field] !== "string") return { error: `report.${field} must be a string` }
-	}
-	if (!Array.isArray(record.evidence) || record.evidence.some((entry) => typeof entry !== "string")) {
-		return { error: "report.evidence must be an array of strings" }
-	}
-	return { value: record as unknown as RoundReport }
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+function renderCall(args: Record<string, unknown>, theme: Theme) {
+	const kind = typeof args?.kind === "string" ? args.kind : "build"
+	const goal = clip(args?.goal, 68)
+	const rounds = typeof args?.rounds === "number" ? args.rounds : DEFAULT_ROUNDS
+	return new Text(
+		`${theme.fg("toolTitle", theme.bold("ralph"))} ${theme.fg("muted", kind)} ${theme.fg("accent", goal)} ${theme.fg("muted", `· ${rounds} rounds`)}`,
+		0,
+		0,
+	)
 }
 
-function readAuditReport(filePath: string): { value?: AuditReport; error?: string } {
-	let parsed: unknown
-	try {
-		parsed = JSON.parse(fs.readFileSync(filePath, "utf8"))
-	} catch (error) {
-		return { error: `audit file missing or unreadable: ${error instanceof Error ? error.message : String(error)}` }
+function renderResult(
+	result: { content: Array<{ type: string; text?: string }>; details?: RalphDetails },
+	options: { expanded: boolean; isPartial: boolean },
+	theme: Theme,
+) {
+	const details = result.details
+	if (options.isPartial || details?.status === undefined) {
+		const progress = textOf(result.content)
+		return new Text(theme.fg("muted", progress.length > 0 ? progress : "running…"), 0, 0)
 	}
-	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return { error: "audit is not an object" }
-	const record = parsed as Record<string, unknown>
-	if (typeof record.material !== "boolean") return { error: "audit.material must be a boolean" }
-	if (typeof record.finding !== "string") return { error: "audit.finding must be a string" }
-	let consequence = ""
-	if (typeof record.consequence === "string") consequence = record.consequence
-	else if (record.material) return { error: "audit.consequence must be a string when material is true" }
-	return { value: { material: record.material, finding: record.finding, consequence } }
-}
 
-function roundPrompt(
-	problemAbs: string,
-	projectRoot: string,
-	problemRel: string,
-	round: number,
-	previous: RoundReport | undefined,
-	reportAbs: string,
-): string {
-	const prior = previous === undefined
-		? "No previous round report exists: ARCHITECTURE.md may still have no candidate."
-		: `Previous round report: ${JSON.stringify(previous)}`
-	return `Problem directory: ${problemAbs}
-Files: ${problemAbs}/CONTRACT.md, ${problemAbs}/QUESTIONS.md, ${problemAbs}/LOG.md, ${problemAbs}/ARCHITECTURE.md
+	const kind = details.kind ?? "build"
+	const profile = PROFILES[kind]
+	const auditNegative =
+		details.audit !== undefined &&
+		((details.audit as DesignAudit).material === true || (details.audit as BuildAudit).satisfied === false)
+	const ok = details.status === "complete"
+	const icon = details.status !== "complete" ? theme.fg("error", "✗") : auditNegative ? theme.fg("warning", "!") : theme.fg("success", "✓")
+	const progress = details.completedRounds === undefined
+		? `${details.done ?? 0}/${details.rounds ?? 0}`
+		: `${details.done ?? 0}/${details.rounds ?? 0} this call · ${details.completedRounds} total`
+	const lines: string[] = [
+		`${icon} ${theme.fg("toolTitle", theme.bold("ralph"))} ${theme.fg("muted", kind)} ${theme.fg("muted", details.status)} ${theme.fg("accent", progress)} ${theme.fg("muted", "rounds")}`,
+	]
 
-Round ${round}. ${prior}
+	if (details.plan) lines.push(theme.fg("muted", `${kind === "design" ? "modes  " : "actions"}  ${details.plan}`))
 
-Prefix experiment files with the round number. Keep everything inside the problem directory.
-
-Write your round report to: ${reportAbs}
-Overwrite that file if it exists. Then, if the project is a git repository, commit only this directory:
-git -C "${projectRoot}" add "${problemRel}" && git -C "${projectRoot}" commit -m "arch_loop round ${round}"`
-}
-
-function auditPrompt(problemAbs: string, reportAbs: string): string {
-	return `Problem directory: ${problemAbs}
-Read only: ${problemAbs}/CONTRACT.md and ${problemAbs}/ARCHITECTURE.md
-
-Write your audit report to: ${reportAbs}
-Overwrite that file if it exists.`
-}
-
-function renderSummary(value: {
-	status: string
-	problemDir: string
-	rounds: number
-	done: number
-	completedRounds?: number
-	nextRound?: number
-	resumedFrom?: number
-	modes: string
-	lastQuestion?: string
-	lastDecision?: string
-	audit?: AuditReport
-	failure?: string
-}): string {
-	const lines: string[] = []
-	const progress = value.completedRounds === undefined
-		? `${value.done}/${value.rounds} rounds`
-		: `${value.done}/${value.rounds} rounds this call · ${value.completedRounds} total`
-	lines.push(`arch_loop ${value.status} — ${value.problemDir} — ${progress}`)
-	if (value.resumedFrom !== undefined) lines.push(`resumed from round ${value.resumedFrom}`)
-	lines.push(`modes: ${value.modes}`)
-	if (value.lastQuestion !== undefined) lines.push(`last question: ${value.lastQuestion}`)
-	if (value.lastDecision !== undefined) lines.push(`last decision: ${value.lastDecision}`)
-	if (value.audit !== undefined) {
-		lines.push(value.audit.material
-			? `audit: MATERIAL GAP — ${value.audit.finding}`
-			: `audit: no material gap — ${value.audit.finding}`)
-		if (value.audit.material) lines.push(`consequence: ${value.audit.consequence}`)
+	if (details.audit) {
+		const auditLines = profile.auditLines(details.audit)
+		const warning =
+			(details.audit as DesignAudit).material === true || (details.audit as BuildAudit).satisfied === false
+		lines.push(theme.fg(warning ? "warning" : "success", auditLines[0]))
+		if (options.expanded) for (const line of auditLines.slice(1)) lines.push(theme.fg("muted", line))
 	}
-	if (value.failure !== undefined) lines.push(`failure: ${value.failure}`)
-	if (value.nextRound !== undefined) {
-		lines.push(
-			value.status === "complete"
-				? `next call starts at round ${value.nextRound}`
-				: `next call continues at round ${value.nextRound}`,
-		)
+
+	if (details.failure) lines.push(theme.fg("error", `failure  ${clip(details.failure, options.expanded ? 4000 : 140)}`))
+
+	if (options.expanded) {
+		lines.push("")
+		if (details.resumedFrom !== undefined) lines.push(theme.fg("muted", `resumed    from round ${details.resumedFrom}`))
+		if (details.problemDir) {
+			lines.push(theme.fg("muted", "state      ") + theme.fg("accent", `${details.problemDir}/{STATE.json,LOG.md}`))
+		}
+		if (details.nextRound !== undefined) {
+			lines.push(
+				theme.fg(
+					"muted",
+					`next       ${details.status === "complete" ? "starts" : "continues"} at round ${details.nextRound}`,
+				),
+			)
+		}
+		if (details.usage) {
+			const usage = details.usage
+			lines.push(
+				theme.fg(
+					"muted",
+					`usage      ${usage.turns ?? 0} turns · ↑${formatTokens(usage.input)} ↓${formatTokens(usage.output)} · $${(usage.cost ?? 0).toFixed(4)}`,
+				),
+			)
+		}
 	}
-	lines.push(`state: ${value.problemDir}/{ARCHITECTURE.md,QUESTIONS.md,LOG.md,STATE.json}`)
-	return lines.join("\n")
+
+	return new Text(lines.join("\n"), 0, 0)
 }
 
-export default function archLoopExtension(pi: ExtensionAPI) {
-	const maxRounds = MAX_ROUNDS
-	const defaultRounds = DEFAULT_ROUNDS
+// ---------------------------------------------------------------------------
+// Extension
+// ---------------------------------------------------------------------------
 
+export default function ralphExtension(pi: ExtensionAPI) {
 	pi.registerTool({
-		name: "arch_loop",
-		label: "Architecture Loop",
+		name: "ralph",
+		label: "Ralph",
 		promptSnippet:
-			"Run a fresh-context architecture design search: repeated design/experiment rounds, then an independent audit of the result",
+			"Run a resumable fresh-context loop: kind=build does verified work in the repo; kind=design searches for a target architecture. State is versioned in the project repo.",
 		promptGuidelines: [
-			"Use arch_loop for architecture, code-structuring, refactor-target and design questions where exploring alternatives and verifying the target matters more than writing production code.",
-			"arch_loop is long-running and blocks the turn. Prefer it when the user wants a considered design target rather than an immediate answer.",
-			"Do not use arch_loop for small edits, bug fixes, or questions answerable by reading the code once.",
+			"Use ralph kind=build for implementation work that benefits from fresh context per round and a final independent verification against the goal.",
+			"Use ralph kind=design for architecture, code-structuring and refactor-target questions where the goal is a design, not code.",
+			"ralph is long-running and blocks the turn. It writes docs/ralph/<name>/ into the project repository and commits it; resuming with the same name and goal continues an interrupted run.",
+			"Do not use ralph for small one-shot edits, busywork, or questions answerable by reading the code once.",
 		],
 		executionMode: "sequential",
 		description:
-			"Run a resumable fresh-context architecture-design search on a problem. Creates or resumes docs/arch-loop/<name>/ inside the project repository (git root of the workspace by default), runs one substantial design iteration per round in a fresh pi child process, then one independent audit. STATE.json is updated after every round, so an interrupted call continues from the next round when called again with the same name. Use for architecture, code-structuring, refactor-target and design questions. Long-running: it blocks the turn until the call budget and audit finish.",
+			"Run a resumable fresh-context loop over a repository. kind='build' does real work one verified unit per round (implement, test, fix, refactor) and ends with an independent verification of the goal. kind='design' searches for the simplest target architecture, one investigation per round, ending with an implementability audit. State lives in docs/ralph/<name>/ inside the project repository and is committed with the code; STATE.json is updated after every round, so an interrupted call continues from the next round when called again with the same name and goal. Long-running: it blocks the turn until the call budget and audit finish.",
 		parameters: Type.Object({
 			goal: Type.String({
 				description:
-					"The problem to design for. Include required behavior, constraints, and non-goals when known; anything missing becomes an open question instead of an invented requirement.",
+					"The objective. For build: what must be true when done, with acceptance criteria in the text when known. For design: the problem, required behavior, constraints and non-goals.",
 			}),
+			kind: Type.Optional(
+				Type.Union([Type.Literal("design"), Type.Literal("build")], {
+					description: 'Protocol to run. Defaults to "build"; use "design" for target-architecture search.',
+				}),
+			),
 			constraints: Type.Optional(
 				Type.String({ description: "Hard constraints only: performance bounds, compatibility, language/runtime, invariants." }),
 			),
-			paths: Type.Optional(Type.Array(Type.String(), { description: "Existing files or directories the design must account for (refactors)." })),
+			paths: Type.Optional(Type.Array(Type.String(), { description: "Existing files or directories the work or design must account for." })),
 			rounds: Type.Optional(
-				Type.Number({ description: `Design rounds to run in this call. Default ${DEFAULT_ROUNDS}, maximum ${MAX_ROUNDS}; later calls add more.` }),
+				Type.Number({ description: `Rounds to run in this call. Default ${DEFAULT_ROUNDS}, maximum ${MAX_ROUNDS}; later calls add more.` }),
 			),
 			name: Type.Optional(
-				Type.String({ description: "Problem directory name. Defaults to a slug of the goal. Reusing a name resumes that problem." }),
+				Type.String({ description: "Problem directory name. Defaults to a slug of the goal. Reusing a name resumes that run." }),
 			),
 			project: Type.Optional(
 				Type.String({
 					description:
-						"Project repository root that owns docs/arch-loop/. Relative paths resolve against the workspace. Defaults to the git root containing the workspace, or the workspace itself.",
+						"Project repository root that owns docs/ralph/. Relative paths resolve against the workspace. Defaults to the git root containing the workspace, or the workspace itself.",
 				}),
 			),
 		}),
@@ -704,21 +918,26 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 		renderResult,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const args = readArgs(params as Record<string, unknown>, maxRounds, defaultRounds)
+			const args = readArgs(params as Record<string, unknown>, MAX_ROUNDS, DEFAULT_ROUNDS)
+			const profile = PROFILES[args.kind]
 			const workspace = ctx.cwd
 			const projectRoot = resolveProjectRoot(args.project, workspace)
-			const problemRel = `docs/arch-loop/${args.slug}`
-			const problemAbs = path.join(projectRoot, "docs", "arch-loop", args.slug)
+			const problemRel = `docs/ralph/${args.slug}`
+			const problemAbs = path.join(projectRoot, "docs", "ralph", args.slug)
 
 			const existing = readState(problemAbs)
 			if (existing !== undefined && typeof existing.goal === "string" && existing.goal.trim() !== args.goal) {
-				throw new Error(`arch_loop: "${args.slug}" already exists in ${problemRel} with a different goal. Use a different name, or delete that directory to start over.`)
+				throw new Error(`ralph: "${args.slug}" already exists in ${problemRel} with a different goal. Use a different name, or delete that directory to start over.`)
 			}
-			ensureState(problemAbs, args)
+			if (existing !== undefined && typeof existing.kind === "string" && existing.kind !== args.kind) {
+				throw new Error(`ralph: "${args.slug}" already exists as kind "${existing.kind}". Use a different name, or delete ${problemRel}/ to switch kind.`)
+			}
+			profile.ensureState(problemAbs, args)
 
 			const resumed = existing !== undefined
 			let state: RunState = existing ?? {
 				version: 1,
+				kind: args.kind,
 				slug: args.slug,
 				goal: args.goal,
 				nextRound: 1,
@@ -731,7 +950,7 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 			// Crash after the child wrote its report but before the state advanced:
 			// ingest that report instead of paying for the round again.
 			if (state.inProgress !== null) {
-				const pending = readRoundReport(path.join(problemAbs, "rounds", `r${padRound(state.inProgress)}.json`))
+				const pending = profile.readReport(path.join(problemAbs, "rounds", `r${padRound(state.inProgress)}.json`))
 				if (pending.value !== undefined) {
 					ingestRound(problemAbs, state.inProgress, pending.value)
 					state = {
@@ -753,14 +972,14 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 			let audit: AuditReport | undefined
 			const totalUsage = emptyUsage()
 
-			state = { ...state, status: "running" }
+			state = { ...state, status: "running", kind: args.kind }
 			writeState(problemAbs, state)
 
-			const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "pi-arch-loop-"))
+			const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-"))
 			const workerPromptPath = path.join(scratch, "worker.md")
 			const auditPromptPath = path.join(scratch, "audit.md")
-			fs.writeFileSync(workerPromptPath, `${WORKER_PERSONA}\n\n${WORKER_PROTOCOL}\n`, "utf8")
-			fs.writeFileSync(auditPromptPath, `${AUDITOR_PERSONA}\n\n${AUDIT_PROTOCOL}\n`, "utf8")
+			fs.writeFileSync(workerPromptPath, profile.workerPrompt, "utf8")
+			fs.writeFileSync(auditPromptPath, profile.auditorPrompt, "utf8")
 
 			const childArgs = (systemPromptPath: string): string[] => {
 				const result = [
@@ -794,6 +1013,7 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 						`${JSON.stringify({
 							at: startedAt,
 							finishedAt: new Date().toISOString(),
+							kind: args.kind,
 							goal: args.goal,
 							projectRoot,
 							rounds: args.rounds,
@@ -824,13 +1044,13 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 					writeState(problemAbs, state)
 
 					onUpdate?.({
-						content: [{ type: "text", text: `arch_loop ${args.slug}: round ${round} running…` }],
-						details: { phase: "round", round, rounds: args.rounds },
+						content: [{ type: "text", text: `ralph ${args.kind} ${args.slug}: round ${round} running…` }],
+						details: { kind: args.kind, phase: "round", round, rounds: args.rounds },
 					})
 
 					const child = await runChild({
 						args: childArgs(workerPromptPath),
-						prompt: roundPrompt(problemAbs, projectRoot, problemRel, round, readLastReport(problemAbs), reportAbs),
+						prompt: profile.roundPrompt(problemAbs, projectRoot, problemRel, round, readLastReport(problemAbs), reportAbs),
 						cwd: projectRoot,
 						signal,
 					})
@@ -844,7 +1064,7 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 						break
 					}
 
-					const report = readRoundReport(reportAbs)
+					const report = profile.readReport(reportAbs)
 					if (report.error !== undefined) {
 						status = "round-failed"
 						failure = `round ${round}: ${report.error}`
@@ -861,10 +1081,10 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 						content: [
 							{
 								type: "text",
-								text: `arch_loop ${args.slug}: ${round} done — ${report.value?.mode}: ${clip(report.value?.question, 120)}`,
+								text: `ralph ${args.kind} ${args.slug}: ${round} done — ${profile.roundLine(report.value as RoundReport)}`,
 							},
 						],
-						details: { phase: "round", round, rounds: args.rounds, mode: report.value?.mode },
+						details: { kind: args.kind, phase: "round", round, rounds: args.rounds },
 					})
 					round += 1
 				}
@@ -873,12 +1093,12 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 					const auditAbs = path.join(problemAbs, "rounds", "audit.json")
 					fs.rmSync(auditAbs, { force: true })
 					onUpdate?.({
-						content: [{ type: "text", text: `arch_loop ${args.slug}: independent audit…` }],
-						details: { phase: "audit" },
+						content: [{ type: "text", text: `ralph ${args.kind} ${args.slug}: independent audit…` }],
+						details: { kind: args.kind, phase: "audit" },
 					})
 					const child = await runChild({
 						args: childArgs(auditPromptPath),
-						prompt: auditPrompt(problemAbs, auditAbs),
+						prompt: profile.auditPrompt(problemAbs, auditAbs),
 						cwd: projectRoot,
 						signal,
 					})
@@ -889,14 +1109,14 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 						const detail = child.errorMessage ?? child.stderr.trim().split("\n").slice(-3).join(" | ")
 						failure = `audit: child exited ${child.code}${detail ? ` — ${clip(detail, 400)}` : ""}`
 					} else {
-						const parsed = readAuditReport(auditAbs)
+						const parsed = profile.readAudit(auditAbs)
 						if (parsed.error !== undefined) {
 							status = "audit-failed"
 							failure = parsed.error
 						} else {
 							audit = parsed.value
 							try {
-								fs.writeFileSync(path.join(problemAbs, "AUDIT.json"), `${JSON.stringify({ at: new Date().toISOString(), ...audit }, null, 2)}\n`, "utf8")
+								fs.writeFileSync(path.join(problemAbs, "AUDIT.json"), `${JSON.stringify({ at: new Date().toISOString(), kind: args.kind, ...audit }, null, 2)}\n`, "utf8")
 							} catch {
 								/* state reporting is best-effort */
 							}
@@ -914,28 +1134,28 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 			writeState(problemAbs, state)
 			recordRun()
 
-			const counts: Record<Mode, number> = { continue: 0, simplify: 0, experiment: 0, rederive: 0 }
-			for (const entry of trajectory) counts[entry.mode] += 1
-			const modes = `${counts.continue} continue · ${counts.simplify} simplify · ${counts.experiment} experiment · ${counts.rederive} rederive`
+			const plan = profile.describePlan(trajectory)
 			const last = trajectory.length > 0 ? trajectory[trajectory.length - 1] : undefined
-			const text = renderSummary({
-				status,
-				problemDir: problemRel,
-				rounds: args.rounds,
-				done: trajectory.length,
-				completedRounds: state.completedRounds,
-				nextRound: state.nextRound,
-				resumedFrom,
-				modes,
-				lastQuestion: last === undefined ? undefined : clip(last.question, 300),
-				lastDecision: last === undefined ? undefined : clip(last.decision, 400),
-				audit,
-				failure,
-			})
+			const auditLines = audit !== undefined ? profile.auditLines(audit) : []
+			const text = [
+				`ralph ${args.kind} ${status} — ${problemRel} — ${trajectory.length}/${args.rounds} rounds this call · ${state.completedRounds} total`,
+				resumedFrom !== undefined ? `resumed from round ${resumedFrom}` : undefined,
+				`${args.kind === "design" ? "modes" : "actions"}: ${plan}`,
+				last !== undefined ? `last: ${clip(profile.roundLine(last), 400)}` : undefined,
+				...auditLines,
+				failure !== undefined ? `failure: ${failure}` : undefined,
+				status === "complete"
+					? `next call starts at round ${state.nextRound}`
+					: `next call continues at round ${state.nextRound}`,
+				`state: ${problemRel}/{STATE.json,LOG.md}`,
+			]
+				.filter((line): line is string => line !== undefined)
+				.join("\n")
 
 			return {
 				content: [{ type: "text", text }],
 				details: {
+					kind: args.kind,
 					status,
 					problemDir: problemRel,
 					rounds: args.rounds,
@@ -943,7 +1163,7 @@ export default function archLoopExtension(pi: ExtensionAPI) {
 					completedRounds: state.completedRounds,
 					nextRound: state.nextRound,
 					resumedFrom,
-					modes: counts,
+					plan,
 					audit,
 					failure,
 					usage: totalUsage,

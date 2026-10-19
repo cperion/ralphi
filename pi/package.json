@@ -2,7 +2,7 @@
   "name": "@local/pi-arch-loop",
   "version": "0.1.0",
   "private": true,
-  "description": "arch_loop for pi: fresh-context architecture design search",
+  "description": "ralph for pi: resumable fresh-context design/build loop",
   "keywords": [
     "pi-package"
   ],
