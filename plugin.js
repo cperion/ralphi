@@ -522,17 +522,23 @@ function requireProvider(ctx, providerName) {
 }
 
 async function runChild(ctx, providerName, parent, signal, request) {
-  const run = await ctx.subagents.start(providerName, {
+  // DSH 0.2.1 seam: one-shot children are started through startActivation.
+  // persona and toolFilter are no longer request capabilities, so the persona is
+  // composed into the prompt and the "do not delegate" rule stays in the protocol.
+  const activation = await ctx.subagents.startActivation({
+    provider: providerName,
     label: request.label,
-    parent,
+    request: {
+      parent,
+      prompt: [{ type: 'text', text: `${request.persona}\n\n${request.prompt}\n\nDo not call the ralph tool; you are one iteration inside it.` }],
+      outputSchema: request.schema,
+      cwd: request.cwd,
+    },
     signal,
-    prompt: [{ type: 'text', text: request.prompt }],
-    outputSchema: request.schema,
-    persona: request.persona,
-    toolFilter: { deny: ['ralph'] },
+    delivery: 'caller',
   })
   try {
-    const result = await run.result
+    const result = await activation.result
     if (result.stopReason !== 'completed') {
       return { error: `child ended with ${result.stopReason}${result.diagnostic === undefined ? '' : `: ${result.diagnostic}`}` }
     }
@@ -541,7 +547,7 @@ async function runChild(ctx, providerName, parent, signal, request) {
     }
     return { value: result.structured }
   } finally {
-    await run.dispose()
+    await activation.dispose()
   }
 }
 
@@ -645,6 +651,7 @@ export async function runRalph(ctx, config, rawArgs, exec) {
         prompt: profile.roundPrompt(problemAbs, projectRoot, problemRel, round, readLastReport(problemAbs)),
         schema: profile.reportSchema,
         persona: profile.workerPersona,
+        cwd: projectRoot,
       })
       if (error !== undefined) {
         status = 'round-failed'
@@ -673,6 +680,7 @@ export async function runRalph(ctx, config, rawArgs, exec) {
         prompt: profile.auditPrompt(problemAbs, projectRoot, problemRel),
         schema: profile.auditSchema,
         persona: profile.auditorPersona,
+        cwd: projectRoot,
       })
       if (auditRun.error !== undefined) {
         status = 'audit-failed'

@@ -124,6 +124,12 @@ The tool can be registered at host scope (available to every agent), inside a
 preset, or both. If the shipped `tool-ralph` row is enabled in the same preset,
 disable it: the scoped built-in `ralph` would shadow this one.
 
+Requires **DSH 0.2.1-rc.2 or newer**: one-shot children are started through
+`ctx.subagents.startActivation({ delivery: "caller" })`. On 0.2.0-rc.2 the tool
+loads but its first call fails, because that release exposed
+`ctx.subagents.start()` instead. The plugin imports only Node builtins, so it
+has no peer dependency to enforce this — check `dsh --version` after upgrading.
+
 After editing `plugin.js` or either patch, restart DSH: the live process imports
 a module generation once.
 
