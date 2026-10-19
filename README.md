@@ -115,12 +115,14 @@ Both harnesses register the same tool name, `ralph`.
 
 ### DSH
 
-Profile `web`, bundle `@local/dsh-plugin-arch-loop` (the package name is
-historical; it now provides `ralph`). Registered twice:
+Installed in a DSH profile as the bundle `@local/dsh-plugin-arch-loop` (the
+package name is historical; it now provides `ralph`). Install it with
+`plugin_manager` / `install_bundle` pointing at this repository, then restart
+DSH.
 
-- host scope — available to every agent;
-- `Coder & Organizer` preset — the built-in `tool-ralph` row is disabled there,
-  because the scoped built-in would shadow this tool.
+The tool can be registered at host scope (available to every agent), inside a
+preset, or both. If the shipped `tool-ralph` row is enabled in the same preset,
+disable it: the scoped built-in `ralph` would shadow this one.
 
 After editing `plugin.js` or either patch, restart DSH: the live process imports
 a module generation once.
@@ -138,7 +140,7 @@ Config in `cordis.patch.yml`:
 Extension in [`pi/`](pi/). Install:
 
 ```sh
-pi install /home/cedric/dev/ralphi/pi
+pi install ./pi
 ```
 
 Each round spawns a fresh `pi` child with built-in tools only
