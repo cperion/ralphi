@@ -3,7 +3,8 @@
  * protocols behind `kind`:
  *
  *   kind: "design"  search for the simplest, clearest target design/architecture
- *   kind: "build"   do real work in the repository, one verified unit per round
+ *   kind: "build"   do real work in the repository, one substantial verified
+ *                   increment per round, resuming from the previous report
  *
  * One call creates (or resumes) `docs/ralph/<slug>/` inside the project
  * repository, runs N rounds each in a fresh `pi` child process, then one
@@ -52,6 +53,7 @@ interface BuildReport {
 	evidence: string[]
 	next: string
 	blocked: string
+	done: boolean
 }
 
 type RoundReport = DesignReport | BuildReport
@@ -125,7 +127,7 @@ interface Profile {
 	workerPrompt: string
 	auditorPrompt: string
 	ensureState(dir: string, args: RalphArgs): void
-	roundPrompt(problemAbs: string, projectRoot: string, problemRel: string, round: number, previous: RoundReport | undefined, reportAbs: string): string
+	roundPrompt(problemAbs: string, projectRoot: string, problemRel: string, round: number, previous: RoundReport | undefined, reportAbs: string, extra: string): string
 	auditPrompt(problemAbs: string, reportAbs: string): string
 	readReport(filePath: string): { value?: RoundReport; error?: string }
 	readAudit(filePath: string): { value?: AuditReport; error?: string }
@@ -139,24 +141,30 @@ interface Profile {
 // ---------------------------------------------------------------------------
 
 const DESIGN_WORKER_PERSONA =
-	"You are an architecture designer and adversarial simplifier. You search for the smallest set of concepts, states, invariants and representations that satisfies the contract. You do not write production code; a prototype, test or benchmark exists only to answer a question. You treat the current design, including your own previous rounds, as a hypothesis, not as a baseline to defend."
+	"You are an architecture designer and adversarial simplifier. You search for the smallest set of concepts, states, invariants and representations that satisfies the contract. You do not write production code; a prototype, test or benchmark exists only to answer a question. You treat the current design, including your own previous rounds, as a hypothesis, not as a baseline to defend. You pursue the most material question until it is answered with evidence, and you measure a round by what the next round can do with it."
 
 const DESIGN_AUDITOR_PERSONA =
 	"You are an independent design auditor. You have not seen the search process. You judge only the contract and the written architecture, and you look for the first place an implementer would have to invent semantics the design did not specify."
 
 const BUILD_WORKER_PERSONA =
-	"You are a careful software engineer working one verified unit at a time. You inspect before changing, keep changes focused, run the project checks, and never claim a result you did not observe. You treat the goal as fixed and record ambiguity instead of inventing requirements."
+	"You are a careful software engineer who works in substantial, verified increments. You inspect before changing, keep changes focused, run the project checks, and never claim a result you did not observe. You treat the goal as fixed and record ambiguity instead of inventing requirements. You finish what you start: you do not trade real progress for a plan, a stub, or a summary, and when a round cannot finish the goal you leave precise continuation instead of a vague direction."
 
 const BUILD_VERIFIER_PERSONA =
 	"You are an independent verifier. You have not seen the work process. You judge only the goal and the actual repository state, and you trust observed commands over written claims."
+
+const CONTINUATION_RULES = `Continuation and progress:
+- The previous round's report is a handoff, not a summary. Start from its next immediately; do not redo discovery that LOG.md, NOTES.md, or the report already record.
+- Do not stop at the first small step. Push the work as far as it can honestly go in this round: make the change, run the checks, fix what fails, commit. A round that ends with "next: implement X" when X was cheap and safe to do now is a wasted round.
+- Finishing the whole goal in one round is not required. Finishing something real and verified is. Incomplete is acceptable; superficial is not.
+- next is the continuation contract: a self-contained instruction the following round can execute with no new investigation — which file, which change, which command, which result proves it. Never leave next as a vague direction.`
 
 const DESIGN_PROTOCOL = `You are one iteration of an architecture-design loop. You have no memory of previous rounds beyond the files in the problem directory.
 
 Read, in this order: CONTRACT.md, QUESTIONS.md, LOG.md (the tail is enough), ARCHITECTURE.md.
 
-Then do exactly one substantial investigation toward the simplest, clearest design that satisfies the contract.
+Then do one substantial investigation toward the simplest, clearest design that satisfies the contract.
 
-Question discovery comes first. Write down three candidate questions, rank them by materiality — could the answer change correctness, the data representation, the number of concepts, or violate a requirement? — and pursue the most material one. If no question is material, say so and refine the incumbent instead of inventing work.
+Question discovery comes first. Write down three candidate questions, rank them by materiality — could the answer change correctness, the data representation, the number of concepts, or violate a requirement? — and pursue the most material one until it is answered with evidence. If the first question turns out immaterial, immediately take the next most material one; only then report.
 
 Choose your mode:
 - continue: improve the incumbent design.
@@ -171,7 +179,11 @@ For refactor problems, existing code is evidence of current behavior, not a cons
 
 Update QUESTIONS.md (add, answer, reject). Append one dense section to LOG.md. Change ARCHITECTURE.md only when evidence justifies replacing the incumbent; keep rejected alternatives and the reason. Put anything longer than a few lines in experiments/.
 
-Do not delegate, build tooling, or invent progress. A round that only eliminates a wrong idea is a successful round.
+An investigation is not progress unless it changes the design or the next round's plan; "no material question remains" is a finding that must be evidenced by an implementable architecture, not a shortcut to end the round. Do not end a round by restating the incumbent, listing questions without pursuing one, or polishing prose — attack the largest remaining implementability risk with simplify, experiment, or rederive and record why nothing material is left open.
+
+Do not delegate, build tooling, or invent progress.
+
+${CONTINUATION_RULES}
 
 Your final action must be writing the round report JSON file named in the user message, with exactly these fields and nothing else:
 {"mode": "continue|simplify|experiment|rederive", "question": "string", "evidence": ["path or result"], "decision": "string", "next": "string"}`
@@ -187,23 +199,28 @@ Your final action must be writing the audit JSON file named in the user message,
 
 const BUILD_PROTOCOL = `You are one iteration of a work loop on a real repository. You have no memory of previous rounds beyond the files in the problem directory.
 
-Read, in this order: GOAL.md, PLAN.md, NOTES.md, LOG.md, then inspect the repository and its git status.
+Read, in this order: GOAL.md, PLAN.md, NOTES.md, LOG.md, then inspect the repository and its git status. Trust the repository over the documents when they disagree, and correct the documents.
 
-Do exactly one unit of work that advances the goal:
-- pick the highest-value step from PLAN.md, or the smallest step that resolves the biggest unknown;
-- if the goal is ambiguous, take the cheapest defensible interpretation and record it in NOTES.md instead of inventing silently;
-- keep changes focused; do not rewrite unrelated code;
-- run the project's checks (tests, build, linter) and fix what you broke; never report success you did not observe;
-- commit the work with a focused message.
+Do one substantial, verified increment of work that advances the goal. Not a plan, not a setup task, not a note about what should change.
+- With a previous report, begin at its next; do not repeat completed work or re-inspect what NOTES.md already records.
+- Choose the highest-value step from PLAN.md. Use a narrow investigation only when a genuinely blocking unknown prevents implementation, and then implement the step it unblocks in the same round.
+- Keep working while safe progress is available: make the change, run the project's checks (tests, build, linter), fix what you broke, commit. Do not stop at the first small edit or at a clear next step that you could execute now.
+- If the goal is ambiguous, take the cheapest defensible interpretation and record it in NOTES.md instead of inventing silently.
+- If you cannot finish the goal this round, leave the repository working and committed, and make next the precise continuation.
+- Blocked means external and concrete: a missing credential, an unavailable service, a decision only the user can make. It never means "this is more than one round of work". A blocked round must record the exact command, error, and what would unblock it.
+- Do not spend the round re-reading files that LOG.md or NOTES.md already summarise, building scaffolding, or writing TODOs, comments, or stubs instead of behavior.
+- Do not delegate, do not build tooling beyond what the task needs, and do not claim progress you cannot evidence.
+- Set done=true only when the goal's acceptance criteria are met AND you ran the checks yourself this round. The loop then runs an independent verifier; if it agrees, the run stops. If the goal is already complete, report done immediately, do not invent polish work, do not re-verify an already recorded close, and do not continue just because rounds remain.
+- Marginal work to "use up" the round budget is a failure, not progress.
 
 Update PLAN.md (done / next), append one dense section to LOG.md, and record durable findings or commands in NOTES.md. Keep scratch work in work/.
 
-Do not delegate, do not build tooling beyond what the task needs, and do not claim progress you cannot evidence.
+${CONTINUATION_RULES}
 
 Actions: implement | fix | test | refactor | investigate | docs.
 
 Your final action must be writing the round report JSON file named in the user message, with exactly these fields and nothing else:
-{"action": "implement|fix|test|refactor|investigate|docs", "summary": "string", "evidence": ["command or file"], "next": "string", "blocked": ""}`
+{"action": "implement|fix|test|refactor|investigate|docs", "summary": "string", "evidence": ["command or file"], "next": "string", "blocked": "", "done": false}`
 
 const BUILD_AUDIT_PROTOCOL = `Independent verification. You have not seen the work process. Read GOAL.md and inspect the repository. Do not trust PLAN.md or LOG.md.
 
@@ -322,6 +339,19 @@ function slugify(text: string): string {
 function clip(value: unknown, limit: number): string {
 	const text = String(value ?? "")
 	return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`
+}
+
+// Build the resume anchor shown to the next round: the previous report is only
+// useful if its `next` is read as the work order for this round.
+function continueFrom(previous: RoundReport | undefined, fallback: string): string {
+	const record = previous as Record<string, unknown> | undefined
+	const next = typeof record?.next === "string" && (record.next as string).trim().length > 0
+		? (record.next as string).trim()
+		: `not recorded — recover the continuation from ${fallback}`
+	const blocked = typeof record?.blocked === "string" && (record.blocked as string).trim().length > 0
+		? `\nIt was blocked: ${(record.blocked as string).trim()}\nClear that blocker first, or work around it when it is not essential to the goal.`
+		: ""
+	return `${next}${blocked}`
 }
 
 function formatTokens(count: number): string {
@@ -519,6 +549,7 @@ function validateBuildReport(record: Record<string, unknown>): { value?: RoundRe
 		if (typeof record[field] !== "string") return { error: `report.${field} must be a string` }
 	}
 	if (!isStringArray(record.evidence)) return { error: "report.evidence must be an array of strings" }
+	if (typeof record.done !== "boolean") return { error: "report.done must be a boolean" }
 	return { value: record as unknown as BuildReport }
 }
 
@@ -554,10 +585,11 @@ const DESIGN_PROFILE: Profile = {
 		ensureFile(path.join(dir, "QUESTIONS.md"), QUESTIONS_TEMPLATE)
 		ensureFile(path.join(dir, "LOG.md"), LOG_HEADER)
 	},
-	roundPrompt(problemAbs, projectRoot, problemRel, round, previous, reportAbs) {
+	roundPrompt(problemAbs, projectRoot, problemRel, round, previous, reportAbs, extra) {
 		const prior = previous === undefined
-			? "No previous round report exists: ARCHITECTURE.md may still have no candidate."
-			: `Previous round report: ${JSON.stringify(previous)}`
+			? "No previous round report exists: ARCHITECTURE.md may still have no candidate. Start real investigation immediately; do not spend the round only on setup."
+			: `Previous round report (handoff): ${JSON.stringify(previous)}
+Resume from its next: ${continueFrom(previous, "ARCHITECTURE.md and LOG.md")}`
 		return `Problem directory: ${problemAbs}
 Files: ${problemAbs}/CONTRACT.md, ${problemAbs}/QUESTIONS.md, ${problemAbs}/LOG.md, ${problemAbs}/ARCHITECTURE.md
 
@@ -567,7 +599,7 @@ Prefix experiment files with the round number. Keep everything inside the proble
 
 Write your round report to: ${reportAbs}
 Overwrite that file if it exists. Then, if the project is a git repository, commit only this directory:
-git -C "${projectRoot}" add "${problemRel}" && git -C "${projectRoot}" commit -m "ralph design round ${round}"`
+git -C "${projectRoot}" add "${problemRel}" && git -C "${projectRoot}" commit -m "ralph design round ${round}"${extra}`
 	},
 	auditPrompt(problemAbs, reportAbs) {
 		return `Problem directory: ${problemAbs}
@@ -615,10 +647,11 @@ const BUILD_PROFILE: Profile = {
 		ensureFile(path.join(dir, "NOTES.md"), NOTES_TEMPLATE)
 		ensureFile(path.join(dir, "LOG.md"), LOG_HEADER)
 	},
-	roundPrompt(problemAbs, projectRoot, problemRel, round, previous, reportAbs) {
+	roundPrompt(problemAbs, projectRoot, problemRel, round, previous, reportAbs, extra) {
 		const prior = previous === undefined
-			? "No previous round report exists: this is the first round."
-			: `Previous round report: ${JSON.stringify(previous)}`
+			? "No previous round report exists: this is the first round. Do real work immediately; do not spend the round only on setup."
+			: `Previous round report (handoff): ${JSON.stringify(previous)}
+Resume from its next: ${continueFrom(previous, "PLAN.md and LOG.md")}`
 		return `Problem directory: ${problemAbs}
 Files: ${problemAbs}/GOAL.md, ${problemAbs}/PLAN.md, ${problemAbs}/NOTES.md, ${problemAbs}/LOG.md
 Workspace: the project repository at ${projectRoot}
@@ -629,7 +662,7 @@ Keep scratch files in ${problemAbs}/work/. Commit your work in the project repos
 
 Write your round report to: ${reportAbs}
 Overwrite that file if it exists. Then commit:
-git -C "${projectRoot}" add -A && git -C "${projectRoot}" commit -m "ralph build round ${round}"`
+git -C "${projectRoot}" add -A && git -C "${projectRoot}" commit -m "ralph build round ${round}"${extra}`
 	},
 	auditPrompt(problemAbs, reportAbs) {
 		return `Goal file: ${problemAbs}/GOAL.md
@@ -885,7 +918,7 @@ export default function ralphExtension(pi: ExtensionAPI) {
 		],
 		executionMode: "sequential",
 		description:
-			"Run a resumable fresh-context loop over a repository. kind='build' does real work one verified unit per round (implement, test, fix, refactor) and ends with an independent verification of the goal. kind='design' searches for the simplest target architecture, one investigation per round, ending with an implementability audit. State lives in docs/ralph/<name>/ inside the project repository and is committed with the code; STATE.json is updated after every round, so an interrupted call continues from the next round when called again with the same name and goal. Long-running: it blocks the turn until the call budget and audit finish.",
+			"Run a resumable fresh-context loop over a repository. kind='build' does a substantial, verified increment of real work per round (implement, fix, test, refactor) and ends with an independent verification of the goal. kind='design' searches for the simplest target architecture, one substantial investigation per round, ending with an implementability audit. Every round resumes from the previous report's next and must leave the repository measurably closer to the goal; incomplete rounds are fine, superficial ones are not. State lives in docs/ralph/<name>/ inside the project repository and is committed with the code; STATE.json is updated after every round, so an interrupted call continues from the next round when called again with the same name and goal. Long-running: it blocks the turn. Build mode stops as soon as an independent verifier accepts the goal, so the remaining rounds are a ceiling, not a quota; a round that reports done triggers verification immediately and attaches any remaining gaps as feedback to the next round.",
 		parameters: Type.Object({
 			goal: Type.String({
 				description:
@@ -901,7 +934,7 @@ export default function ralphExtension(pi: ExtensionAPI) {
 			),
 			paths: Type.Optional(Type.Array(Type.String(), { description: "Existing files or directories the work or design must account for." })),
 			rounds: Type.Optional(
-				Type.Number({ description: `Rounds to run in this call. Default ${DEFAULT_ROUNDS}, maximum ${MAX_ROUNDS}; later calls add more.` }),
+				Type.Number({ description: `Rounds to run in this call. Default ${DEFAULT_ROUNDS}, maximum ${MAX_ROUNDS}; later calls add more. Build mode stops early once the goal is verified, so this is a ceiling.` }),
 			),
 			name: Type.Optional(
 				Type.String({ description: "Problem directory name. Defaults to a slug of the goal. Reusing a name resumes that run." }),
@@ -970,6 +1003,10 @@ export default function ralphExtension(pi: ExtensionAPI) {
 			let status = "complete"
 			let failure: string | undefined
 			let audit: AuditReport | undefined
+			let verified = false
+			let earlyStopRound: number | undefined
+			let feedback: string | undefined
+			let lastRejectedGaps: string | undefined
 			const totalUsage = emptyUsage()
 
 			state = { ...state, status: "running", kind: args.kind }
@@ -1006,6 +1043,34 @@ export default function ralphExtension(pi: ExtensionAPI) {
 				totalUsage.turns += child.usage.turns
 			}
 
+			const verifyGoal = async (): Promise<{ value?: AuditReport; error?: string }> => {
+				const auditAbs = path.join(problemAbs, "rounds", "audit.json")
+				fs.rmSync(auditAbs, { force: true })
+				onUpdate?.({
+					content: [{ type: "text", text: `ralph ${args.kind} ${args.slug}: independent verification…` }],
+					details: { kind: args.kind, phase: "audit" },
+				})
+				const child = await runChild({
+					args: childArgs(auditPromptPath),
+					prompt: profile.auditPrompt(problemAbs, auditAbs),
+					cwd: projectRoot,
+					signal,
+				})
+				addUsage(child)
+				if (!child.ok) {
+					const detail = child.errorMessage ?? child.stderr.trim().split("\n").slice(-3).join(" | ")
+					return { error: `audit: child exited ${child.code}${detail ? ` — ${clip(detail, 400)}` : ""}` }
+				}
+				const parsed = profile.readAudit(auditAbs)
+				if (parsed.error !== undefined) return { error: parsed.error }
+				try {
+					fs.writeFileSync(path.join(problemAbs, "AUDIT.json"), `${JSON.stringify({ at: new Date().toISOString(), kind: args.kind, ...parsed.value }, null, 2)}\n`, "utf8")
+				} catch {
+					/* state reporting is best-effort */
+				}
+				return { value: parsed.value as AuditReport }
+			}
+
 			const recordRun = () => {
 				try {
 					fs.appendFileSync(
@@ -1018,6 +1083,8 @@ export default function ralphExtension(pi: ExtensionAPI) {
 							projectRoot,
 							rounds: args.rounds,
 							done: trajectory.length,
+							earlyStopRound,
+							verified,
 							firstRound: resumedFrom ?? 1,
 							completedRounds: state.completedRounds,
 							nextRound: state.nextRound,
@@ -1048,9 +1115,14 @@ export default function ralphExtension(pi: ExtensionAPI) {
 						details: { kind: args.kind, phase: "round", round, rounds: args.rounds },
 					})
 
+					const budgetHint = args.kind === "build"
+						? `\n\nBudget: at most ${args.rounds} round(s) in this call. That is a ceiling, not a quota. If the goal's acceptance criteria are met and verified, set done=true; an independent verifier decides whether the loop stops. Do not create marginal work to consume the budget.`
+						: ""
+					const promptExtra = `${budgetHint}${feedback === undefined ? "" : `\n\n${feedback}`}`
+					feedback = undefined
 					const child = await runChild({
 						args: childArgs(workerPromptPath),
-						prompt: profile.roundPrompt(problemAbs, projectRoot, problemRel, round, readLastReport(problemAbs), reportAbs),
+						prompt: profile.roundPrompt(problemAbs, projectRoot, problemRel, round, readLastReport(problemAbs), reportAbs, promptExtra),
 						cwd: projectRoot,
 						signal,
 					})
@@ -1086,41 +1158,46 @@ export default function ralphExtension(pi: ExtensionAPI) {
 						],
 						details: { kind: args.kind, phase: "round", round, rounds: args.rounds },
 					})
+
+					// Build mode stops as soon as an independent verifier agrees the goal is met.
+					// The round budget is a ceiling; it must never turn into a quota of busywork.
+					if (args.kind === "build" && (report.value as BuildReport).done === true) {
+						const verification = await verifyGoal()
+						if (verification.error !== undefined) {
+							status = "audit-failed"
+							failure = verification.error
+							break
+						}
+						audit = verification.value
+						const buildAudit = audit as BuildAudit
+						if (buildAudit.satisfied !== true) {
+							const gaps = Array.isArray(buildAudit.gaps) ? buildAudit.gaps : []
+							const key = JSON.stringify(gaps)
+							if (lastRejectedGaps !== undefined && key === lastRejectedGaps) {
+								status = "blocked"
+								failure = `independent verification rejected the goal twice with the same gaps: ${gaps.join("; ") || "(none listed)"}`
+								break
+							}
+							lastRejectedGaps = key
+							feedback = `Independent verification did not accept the goal yet. Gaps:\n- ${gaps.length > 0 ? gaps.join("\n- ") : "(none listed; re-read GOAL.md and inspect the workspace)"}\nClose these gaps before reporting done again.`
+						} else {
+							verified = true
+							earlyStopRound = round
+							break
+						}
+					}
 					round += 1
 				}
 
-				if (status === "complete" && !signal?.aborted) {
-					const auditAbs = path.join(problemAbs, "rounds", "audit.json")
-					fs.rmSync(auditAbs, { force: true })
-					onUpdate?.({
-						content: [{ type: "text", text: `ralph ${args.kind} ${args.slug}: independent audit…` }],
-						details: { kind: args.kind, phase: "audit" },
-					})
-					const child = await runChild({
-						args: childArgs(auditPromptPath),
-						prompt: profile.auditPrompt(problemAbs, auditAbs),
-						cwd: projectRoot,
-						signal,
-					})
-					addUsage(child)
-
-					if (!child.ok) {
+				if (status === "complete" && !signal?.aborted && !verified) {
+					const verification = await verifyGoal()
+					if (verification.error !== undefined) {
 						status = "audit-failed"
-						const detail = child.errorMessage ?? child.stderr.trim().split("\n").slice(-3).join(" | ")
-						failure = `audit: child exited ${child.code}${detail ? ` — ${clip(detail, 400)}` : ""}`
+						failure = verification.error
 					} else {
-						const parsed = profile.readAudit(auditAbs)
-						if (parsed.error !== undefined) {
-							status = "audit-failed"
-							failure = parsed.error
-						} else {
-							audit = parsed.value
-							try {
-								fs.writeFileSync(path.join(problemAbs, "AUDIT.json"), `${JSON.stringify({ at: new Date().toISOString(), kind: args.kind, ...audit }, null, 2)}\n`, "utf8")
-							} catch {
-								/* state reporting is best-effort */
-							}
-						}
+						audit = verification.value
+						const buildAudit = audit as BuildAudit
+						verified = args.kind === "build" ? buildAudit.satisfied === true : (audit as DesignAudit).material === false
 					}
 				}
 			} catch (error) {
@@ -1140,6 +1217,7 @@ export default function ralphExtension(pi: ExtensionAPI) {
 			const text = [
 				`ralph ${args.kind} ${status} — ${problemRel} — ${trajectory.length}/${args.rounds} rounds this call · ${state.completedRounds} total`,
 				resumedFrom !== undefined ? `resumed from round ${resumedFrom}` : undefined,
+				earlyStopRound !== undefined ? `stopped early: goal verified at round ${earlyStopRound} of ${args.rounds}` : undefined,
 				`${args.kind === "design" ? "modes" : "actions"}: ${plan}`,
 				last !== undefined ? `last: ${clip(profile.roundLine(last), 400)}` : undefined,
 				...auditLines,
@@ -1160,6 +1238,7 @@ export default function ralphExtension(pi: ExtensionAPI) {
 					problemDir: problemRel,
 					rounds: args.rounds,
 					done: trajectory.length,
+					earlyStopRound,
 					completedRounds: state.completedRounds,
 					nextRound: state.nextRound,
 					resumedFrom,

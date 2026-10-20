@@ -30,12 +30,16 @@ ralph({ kind: "design", goal: "Design the module structure and data types for X"
 | `kind` | `build` (default) or `design`. |
 | `constraints` | Hard constraints only: bounds, compatibility, runtime, invariants. |
 | `paths` | Existing files/directories the work or design must account for. |
-| `rounds` | Rounds to run in this call. Default 24, ceiling 64; later calls add more. |
+| `rounds` | Rounds to run in this call. Default 24, ceiling 64; later calls add more. Build mode stops early once the goal is verified, so this is a ceiling, not a quota. |
 | `name` | Stable directory name. Reusing it resumes that run. |
 | `project` | Repository root that owns `docs/ralph/`. Defaults to the git root containing the workspace, else the workspace. |
+| `answer` | The user's answer to a question from a previous `needs-input` run. Omit otherwise. |
 
 Long-running: the call blocks the turn. Cancelling preserves every completed
-round; call again with the same `name` and `goal` to continue.
+round; call again with the same `name` and `goal` to continue. In build mode a
+round that reports `done` triggers the independent verifier immediately: if it
+accepts the goal the run stops early, and if it rejects the concrete gaps are
+fed into the next round. Remaining rounds are never burned on busywork.
 
 ## What it creates
 
@@ -48,6 +52,7 @@ docs/ralph/<slug>/
   rounds.jsonl      per-round reports (controller-owned)
   runs.jsonl        one record per call (controller-owned)
   AUDIT.json        independent verification result
+  ANSWERS.md        controller-owned trail of user questions and answers
   rounds/           per-round report files (pi port)
   LOG.md            append-only per-round record
 ```
@@ -73,18 +78,69 @@ docs/ralph/<slug>/
 ## What a round does
 
 `build`: read `GOAL.md`, `PLAN.md`, `NOTES.md`, `LOG.md`, inspect the repo and
-git status; pick the highest-value unit (or the smallest step that resolves the
-biggest unknown); implement it; run the project's checks and fix damage; commit;
-update the three files; report `{action, summary, evidence, next, blocked}`.
-The audit is a fresh verifier that runs the checks itself and returns
-`{satisfied, evidence, gaps}` — it does not trust the log.
+git status; resume from the previous report's `next`; pick the highest-value
+step from `PLAN.md`; implement it and keep going while safe progress is
+available (not just the first small edit); run the project's checks and fix
+damage; commit; update the three files; report
+`{action, summary, evidence, next, blocked, ask}`. A round must leave the
+repository measurably closer to the goal: finishing the whole goal in one round
+is not required, superficial work is rejected. The audit is a fresh verifier that
+runs the checks itself and returns `{satisfied, evidence, gaps}` — it does not
+trust the log.
 
 `design`: read the four design files; write three candidate questions, rank by
-materiality, pursue the most material one; choose `continue`, `simplify`,
-`experiment`, or `rederive` (contract-only, independent design first); update
-the files, commit, report `{mode, question, evidence, decision, next}`. The audit
-tries to implement the contract and reports the first place it must invent
-semantics.
+materiality, and pursue the most material one until it is answered with
+evidence (an immaterial first question means chasing the next one, not ending
+the round); choose `continue`, `simplify`, `experiment`, or `rederive`
+(contract-only, independent design first); update the files, commit, report
+`{mode, question, evidence, decision, next, ask}`. The audit tries to implement
+the contract and reports the first place it must invent semantics.
+
+### User questions
+
+A round has no direct line to the user, but it is not forced to guess. When a
+user-owned decision changes the work, the round sets `ask` instead of inventing a
+requirement or calling itself blocked:
+
+- the controller relays the question to the user through the host question
+  service while the ralph call is still open;
+- the answer is written to `ANSWERS.md` and into `STATE.json`, and the next round
+  receives it as `userAnswer` and must apply it first;
+- if the relay cannot run (no answerer, or ralph was started inside a child
+  agent), the call ends with status `needs-input` and the question in its result.
+  The caller asks the user, then re-invokes `ralph` with the same `name` and
+  `goal` plus `answer`.
+
+### Progress discipline
+
+The round prompt is the control surface against lazy microsteps. Every round:
+
+- starts from the previous report's `next` and does not redo discovery already
+  recorded in `LOG.md` or `NOTES.md`;
+- keeps working while safe progress is available, instead of stopping at the
+  first edit or at a next step it could execute now;
+- treats "blocked" as external and concrete only (missing credential, unavailable
+  service), never as "this needs more than one round" and never as a user-owned
+  decision — those go to `ask`;
+- writes `next` as a self-contained continuation contract: which file, which
+  change, which command, which result proves it.
+
+### Early completion
+
+`build` mode must not keep working after the goal is met. A build round sets
+`done: true` only when it ran the checks and believes the acceptance criteria
+are satisfied. The controller then:
+
+1. runs the independent verifier immediately (it does not wait for the round
+   budget);
+2. stops with `complete` and an early-stop line when the verifier agrees;
+3. otherwise passes the verifier's concrete gaps into the next round as
+   feedback, so the round fixes the real gap instead of guessing;
+4. stops with `blocked` when two consecutive verifications reject the goal with
+   identical gaps — that is a disagreement the loop cannot resolve by itself.
+
+`design` mode keeps its full search budget: it is an exploration, not a
+done-condition, and stops on its audit only at the end of the call.
 
 ## Resume
 
@@ -95,6 +151,8 @@ or the machine stops mid-call, call again with the same `name`, `kind`, and
 - completed rounds are never repeated;
 - a round whose report was already written is ingested instead of re-run (pi);
 - a round interrupted mid-flight is retried at the same number;
+- a round that asked the user resumes at the next round with the answer, whether
+  it was relayed live or supplied as `answer` after a `needs-input` result;
 - the interrupted round is the resume granularity, not the conversation;
 - the same name with a different goal or kind is rejected instead of mixed.
 
@@ -163,3 +221,7 @@ validates it. `/reload` after editing.
 - One auditor/verifier, not an adversarial panel.
 - Completion is a per-call budget plus an audit verdict; no auto-continuation
   after a restart — re-invoke with the same name and goal.
+- Question relay requires the exact live root agent as caller. A ralph started
+  inside another agent ends `needs-input` instead of blocking forever.
+- The pi port does not relay user questions; a pi round guesses or reports
+  blocked.
